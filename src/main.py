@@ -2,6 +2,7 @@ import os
 import sys
 import shutil
 import json
+import re
 
 import numpy as np
 import cv2
@@ -32,7 +33,40 @@ from PySide6.QtWidgets import (
     QWidget,
     QProgressBar,
     QMenu,
+    QGroupBox,
+    QGridLayout,
+    QMessageBox,
 )
+
+class ScalableImageLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self._original_pixmap = None
+
+    def setPixmap(self, pixmap):
+        self._original_pixmap = pixmap
+        self.update() # Trigger paintEvent
+
+    def paintEvent(self, event):
+        if not self._original_pixmap or self._original_pixmap.isNull():
+            super().paintEvent(event)
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        
+        # Calculate target size keeping aspect ratio
+        target_rect = QRectF(self.rect())
+        img_size = self._original_pixmap.size()
+        scaled_size = img_size.scaled(target_rect.size().toSize(), Qt.KeepAspectRatio)
+        
+        # Center the image
+        x = (target_rect.width() - scaled_size.width()) / 2
+        y = (target_rect.height() - scaled_size.height()) / 2
+        
+        painter.drawPixmap(int(x), int(y), scaled_size.width(), scaled_size.height(), self._original_pixmap)
 
 class GridItem(QGraphicsItem):
     def __init__(self, rect: QRectF, stride: int, patch_width: int, patch_height: int):
@@ -143,12 +177,19 @@ class GridItem(QGraphicsItem):
 
 
 class CanvasWidget(QGraphicsView):
+    # Signal to notify when a point is clicked (x, y)
+    canvas_clicked = Signal(float, float)
+
     def __init__(self):
         super().__init__()
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
-        self.setDragMode(QGraphicsView.NoDrag)
+        self.setDragMode(QGraphicsView.NoDrag) # Disable drag since we always fit in view
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        # Disable scrollbars to force fit
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self._pixmap_item = QGraphicsPixmapItem()
@@ -161,30 +202,24 @@ class CanvasWidget(QGraphicsView):
         self.setBackgroundBrush(Qt.black)
         self._mask = None
         self._mask_rgba = None
-        self._drawing = False
-        self._brush_size = 24
-        self._last_pos = None
-        self._tool_mode = "brush"
-        self._polygon_points = []
         self._undo_stack = []
         self._redo_stack = []
-        self._space_pressed = False
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
-            self._space_pressed = True
-            self.setDragMode(QGraphicsView.ScrollHandDrag)
-        super().keyPressEvent(event)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            scene_pos = self.mapToScene(event.pos())
+            self.canvas_clicked.emit(scene_pos.x(), scene_pos.y())
+        super().mousePressEvent(event)
 
-    def keyReleaseEvent(self, event):
-        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
-            self._space_pressed = False
-            self.setDragMode(QGraphicsView.NoDrag)
-        super().keyReleaseEvent(event)
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_in_view()
 
-    def wheelEvent(self, event):
-        # Zoom with Ctrl + Wheel or just Wheel if preferred.
-        # User requested "adjust intermediate panel image display size", so Zoom is key.
+    def _fit_in_view(self):
+        if not self._pixmap_item.pixmap().isNull():
+            self.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
+
+    def load_image(self, path: str):
         # Standard behavior: Ctrl + Wheel for zoom.
         if event.modifiers() & Qt.ControlModifier:
             zoom_in = event.angleDelta().y() > 0
@@ -192,10 +227,7 @@ class CanvasWidget(QGraphicsView):
             self.scale(factor, factor)
             event.accept()
         else:
-            # Optional: Allow zoom without Ctrl if no vertical scroll is needed
-            # But let's stick to standard Ctrl+Zoom first.
             super().wheelEvent(event)
-
 
     def load_image(self, path: str):
         pixmap = QPixmap(path)
@@ -209,7 +241,7 @@ class CanvasWidget(QGraphicsView):
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._update_mask_item()
-        self.fitInView(rect, Qt.KeepAspectRatio)
+        self._fit_in_view() # Use the helper method
         return True
 
     def set_stride(self, stride: int):
@@ -224,26 +256,17 @@ class CanvasWidget(QGraphicsView):
     def set_highlight_rect(self, rect: QRectF):
         self._grid_item.set_highlight_rect(rect)
 
-    def set_mask_opacity(self, opacity: float):
-        self._mask_item.setOpacity(opacity)
-
-    def set_brush_size(self, size: int):
-        self._brush_size = max(1, size)
-    
     def get_patch_counts(self):
         return self._grid_item.get_patch_counts()
 
-    def set_tool_mode(self, mode: str):
-        self._tool_mode = mode
-        if mode != "polygon":
-            self._polygon_points = []
+    def set_mask_opacity(self, opacity: float):
+        self._mask_item.setOpacity(opacity)
 
     def clear_mask(self):
         if self._mask is None:
             return
         self.push_undo()
         self._mask.fill(0)
-        self._polygon_points = []
         self._update_mask_item()
 
     def reset_view(self):
@@ -290,74 +313,16 @@ class CanvasWidget(QGraphicsView):
         image = QImage(self._mask_rgba.data, w, h, QImage.Format_RGBA8888)
         self._mask_item.setPixmap(QPixmap.fromImage(image))
 
-    def mousePressEvent(self, event):
-        if self._space_pressed:
-            super().mousePressEvent(event)
-            return
-        if event.button() == Qt.LeftButton and self._tool_mode == "polygon":
-            pos = self.mapToScene(event.pos())
-            self._polygon_points.append((int(pos.x()), int(pos.y())))
-            return
-        if event.button() == Qt.LeftButton:
-            if self._tool_mode in ("brush", "eraser"):
-                self.push_undo()
-            self._drawing = True
-            self._last_pos = self.mapToScene(event.pos())
-            self._draw_to_mask(self._last_pos, self._last_pos)
-        else:
-            super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self._drawing and self._tool_mode in ("brush", "eraser"):
-            pos = self.mapToScene(event.pos())
-            self._draw_to_mask(self._last_pos, pos)
-            self._last_pos = pos
-        else:
-            super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            if self._tool_mode == "rect":
-                self.push_undo()
-                end_pos = self.mapToScene(event.pos())
-                self._draw_rect_to_mask(self._last_pos, end_pos)
-            self._drawing = False
-            self._last_pos = None
-        elif event.button() == Qt.RightButton and self._tool_mode == "polygon":
-            self._finish_polygon()
-        else:
-            super().mouseReleaseEvent(event)
-
-    def _draw_to_mask(self, start: QPointF, end: QPointF):
+    def fill_rect(self, rect: QRectF, value: int):
         if self._mask is None:
             return
-        h, w = self._mask.shape
-        x1, y1 = int(min(max(start.x(), 0), w - 1)), int(min(max(start.y(), 0), h - 1))
-        x2, y2 = int(min(max(end.x(), 0), w - 1)), int(min(max(end.y(), 0), h - 1))
-        value = 255 if self._tool_mode == "brush" else 0
-        cv2.line(self._mask, (x1, y1), (x2, y2), value, self._brush_size)
+        self.push_undo()
+        x = int(rect.x())
+        y = int(rect.y())
+        w = int(rect.width())
+        h = int(rect.height())
+        cv2.rectangle(self._mask, (x, y), (x + w, y + h), value, -1)
         self._update_mask_item()
-
-    def _draw_rect_to_mask(self, start: QPointF, end: QPointF):
-        if self._mask is None or start is None:
-            return
-        h, w = self._mask.shape
-        x1, y1 = int(min(max(start.x(), 0), w - 1)), int(min(max(start.y(), 0), h - 1))
-        x2, y2 = int(min(max(end.x(), 0), w - 1)), int(min(max(end.y(), 0), h - 1))
-        x_min, x_max = sorted([x1, x2])
-        y_min, y_max = sorted([y1, y2])
-        cv2.rectangle(self._mask, (x_min, y_min), (x_max, y_max), 255, -1)
-        self._update_mask_item()
-
-    def _finish_polygon(self):
-        if self._mask is None:
-            return
-        if len(self._polygon_points) >= 3:
-            self.push_undo()
-            pts = np.array([self._polygon_points], dtype=np.int32)
-            cv2.fillPoly(self._mask, pts, 255)
-            self._update_mask_item()
-        self._polygon_points = []
 
     def get_mask(self):
         if self._mask is None:
@@ -372,6 +337,7 @@ class CanvasWidget(QGraphicsView):
         self._update_mask_item()
 
 
+
 class ProjectManager:
     def __init__(self):
         self.project_path = None
@@ -379,6 +345,8 @@ class ProjectManager:
         self.masks = {} # map path -> mask (numpy array)
         self.current_index = -1
         self.config = {}
+        self.normal_dir = None
+        self.abnormal_dir = None
 
     def set_images(self, images):
         self.images = images
@@ -528,6 +496,9 @@ class MainWindow(QMainWindow):
         self._thumbnail_queue = { }
         self._thumbnail_timer = None
         self._slicer_thread = None
+        self._patch_coords = []
+        self._current_patch_index = 0
+
 
     def _create_actions(self):
         # File Actions
@@ -554,48 +525,14 @@ class MainWindow(QMainWindow):
         self.redo_action.setShortcut("Ctrl+Shift+Z")
         self.redo_action.triggered.connect(lambda: self.canvas.redo())
 
-        self.open_image_action = QAction("打开图片/文件夹", self)
-        self.open_image_action.triggered.connect(self._open_image)
-        self.brush_action = QAction("画笔", self)
-        self.rect_action = QAction("矩形", self)
-        self.poly_action = QAction("多边形", self)
-        self.eraser_action = QAction("橡皮擦", self)
-        
-        # Tool Shortcuts
-        self.brush_action.setShortcut("B")
-        self.rect_action.setShortcut("R")
-        self.poly_action.setShortcut("P")
-        self.eraser_action.setShortcut("E")
-
-        for action in (self.brush_action, self.rect_action, self.poly_action, self.eraser_action):
-            action.setCheckable(True)
-        self.tool_group = QActionGroup(self)
-        for action in (self.brush_action, self.rect_action, self.poly_action, self.eraser_action):
-            self.tool_group.addAction(action)
-        self.brush_action.setChecked(True)
-        self.brush_action.triggered.connect(lambda: self.canvas.set_tool_mode("brush"))
-        self.rect_action.triggered.connect(lambda: self.canvas.set_tool_mode("rect"))
-        self.poly_action.triggered.connect(lambda: self.canvas.set_tool_mode("polygon"))
-        self.eraser_action.triggered.connect(lambda: self.canvas.set_tool_mode("eraser"))
-
         # Initialize Canvas early for signal connections
         self.canvas = CanvasWidget()
-
-        self.increase_brush_action = QAction("Increase Brush", self)
-        self.increase_brush_action.setShortcut("]")
-        self.increase_brush_action.triggered.connect(self._increase_brush_size)
-
-        self.decrease_brush_action = QAction("Decrease Brush", self)
-        self.decrease_brush_action.setShortcut("[")
-        self.decrease_brush_action.triggered.connect(self._decrease_brush_size)
 
         self.slice_and_next_action = QAction("Slice and Next", self)
         self.slice_and_next_action.setShortcut("Return")
         self.slice_and_next_action.triggered.connect(self._on_slice_and_next)
         
         self.addAction(self.slice_and_next_action)
-        self.addAction(self.increase_brush_action)
-        self.addAction(self.decrease_brush_action)
 
     def _build_ui(self):
         menubar = self.menuBar()
@@ -610,39 +547,84 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.undo_action)
         edit_menu.addAction(self.redo_action)
 
-        toolbar = self.addToolBar("工具栏")
-        toolbar.addAction(self.open_image_action)
-        toolbar.addSeparator()
-        toolbar.addAction(self.brush_action)
-        toolbar.addAction(self.rect_action)
-        toolbar.addAction(self.poly_action)
-        toolbar.addAction(self.eraser_action)
-
         # Main Layout with Splitter
-        splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter = QSplitter(Qt.Horizontal)
         
         # 1. Left Panel
         self.control_panel = self._build_control_panel()
         
-        # 2. Canvas (Center)
-        # self.canvas is already initialized in _create_actions or before _build_control_panel
+        # 2. Center Panel (Patch Viewer Only)
+        self.patch_viewer = self._build_patch_viewer()
+        self.patch_viewer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
         # 3. Gallery (Right)
         self.gallery = self._build_gallery()
 
-        splitter.addWidget(self.control_panel)
-        splitter.addWidget(self.canvas)
-        splitter.addWidget(self.gallery)
+        self.main_splitter.addWidget(self.control_panel)
+        self.main_splitter.addWidget(self.patch_viewer)
+        self.main_splitter.addWidget(self.gallery)
         
-        # Set stretch factors: 0 for side panels (fixed/auto), 1 for canvas (expand)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
+        # Set stretch factors for main splitter
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 0)
         
-        # Set initial sizes to respect minimum widths
-        splitter.setSizes([320, 800, 320])
+        # Set initial sizes
+        self.main_splitter.setSizes([350, 1000, 320])
 
-        self.setCentralWidget(splitter)
+        self.setCentralWidget(self.main_splitter)
+
+    def _build_patch_viewer(self):
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        
+        # Title
+        title = QLabel("单元检视 (Unit Review)")
+        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Patch Display
+        self.patch_display_label = ScalableImageLabel()
+        self.patch_display_label.setAlignment(Qt.AlignCenter)
+        self.patch_display_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.patch_display_label.setStyleSheet("border: 2px dashed #444; background-color: #111;")
+        layout.addWidget(self.patch_display_label, 1) # Stretch 1
+        
+        # Info
+        self.patch_info_label = QLabel("进度: -/-")
+        self.patch_info_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.patch_info_label)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.btn_no_defect = QPushButton("无缺陷")
+        self.btn_defect = QPushButton("有缺陷")
+        
+        self.btn_no_defect.setStyleSheet("background-color: #388E3C; color: white; font-weight: bold; padding: 8px;")
+        self.btn_defect.setStyleSheet("background-color: #D32F2F; color: white; font-weight: bold; padding: 8px;")
+        
+        self.btn_no_defect.clicked.connect(self._on_patch_no_defect)
+        self.btn_defect.clicked.connect(self._on_patch_defect)
+        
+        btn_layout.addWidget(self.btn_no_defect)
+        btn_layout.addWidget(self.btn_defect)
+        layout.addLayout(btn_layout)
+        
+        # Navigation
+        nav_layout = QHBoxLayout()
+        
+        self.prev_image_button = QPushButton("上一张大图")
+        self.prev_image_button.clicked.connect(self._on_prev_image)
+        nav_layout.addWidget(self.prev_image_button)
+        
+        self.next_button = QPushButton("下一张大图")
+        self.next_button.clicked.connect(self._on_next_image)
+        nav_layout.addWidget(self.next_button)
+        layout.addLayout(nav_layout)
+        
+        layout.addStretch()
+        return container
 
     def _build_control_panel(self):
         panel = QWidget()
@@ -651,37 +633,37 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10) # Increase spacing slightly
 
         # Path selection helpers
-        def create_path_selector(label_text, line_edit, is_folder=True):
-            container = QWidget()
-            h_layout = QHBoxLayout(container)
-            h_layout.setContentsMargins(0, 0, 0, 0)
-            
-            # Label
-            lbl = QLabel(label_text)
-            lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-            h_layout.addWidget(lbl)
-            
-            # Input + Button in a sub-layout or just add them
-            # To make inputs stretch and align well, let's use a VBox for label + (Input-Btn HBox)
-            # But user wants vertical stretch distribution. 
-            # Let's keep it simple: VBox[ Label, HBox[Input, Btn] ]
-            
+        def create_path_selector(label_text, label_widget, is_folder=True):
             wrapper = QWidget()
             v_layout = QVBoxLayout(wrapper)
             v_layout.setContentsMargins(0, 0, 0, 0)
             v_layout.setSpacing(2)
+            
+            # Label
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet("color: #aaa; font-weight: bold; font-size: 11px;")
             v_layout.addWidget(lbl)
             
+            # Input + Button in a sub-layout or just add them
             input_container = QWidget()
             input_layout = QHBoxLayout(input_container)
             input_layout.setContentsMargins(0, 0, 0, 0)
             input_layout.setSpacing(2)
-            input_layout.addWidget(line_edit)
+            
+            # Configure label widget (QLabel for wrapping)
+            label_widget.setWordWrap(True)
+            label_widget.setStyleSheet("color: #ddd; border: 1px solid #444; border-radius: 2px; padding: 2px; font-size: 12px;")
+            label_widget.setText("未选择")
+            # Ensure it doesn't take too much vertical space but can expand
+            label_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+            
+            input_layout.addWidget(label_widget, 1)
             
             btn = QPushButton("...")
             btn.setFixedWidth(30)
             if is_folder:
-                btn.clicked.connect(lambda: self._select_folder(line_edit))
+                # Adjust _select_folder to work with QLabel
+                btn.clicked.connect(lambda: self._select_folder(label_widget))
             else:
                  pass 
             input_layout.addWidget(btn)
@@ -690,26 +672,30 @@ class MainWindow(QMainWindow):
             return wrapper, btn
 
         # Source Path
-        self.source_path_edit = QLineEdit()
-        source_widget, self.source_btn = create_path_selector("原始图源路径", self.source_path_edit, False)
-        self.source_btn.clicked.disconnect() # Disconnect generic handler if any
-        self.source_btn.clicked.connect(self._open_image)
-        layout.addWidget(source_widget, 1) # Stretch factor 1
+        self.source_path_label = QLabel()
+        source_widget, self.source_btn = create_path_selector("原始图源路径", self.source_path_label, False)
+        # self.source_btn.clicked.disconnect() 
+        # Remove the button from this widget since we moved it to Action group
+        self.source_btn.setVisible(False)
+        layout.addWidget(source_widget, 0) 
 
         # Normal Path
-        self.normal_path_edit = QLineEdit()
-        normal_widget, self.normal_btn = create_path_selector("Normal 输出路径", self.normal_path_edit, True)
-        layout.addWidget(normal_widget, 1)
+        self.normal_path_label = QLabel()
+        normal_widget, self.normal_btn = create_path_selector("Normal 输出路径", self.normal_path_label, True)
+        self.normal_btn.clicked.connect(lambda: self._select_normal_dir(self.normal_path_label))
+        layout.addWidget(normal_widget, 0)
 
         # Abnormal Path
-        self.abnormal_path_edit = QLineEdit()
-        abnormal_widget, self.abnormal_btn = create_path_selector("Abnormal 输出路径", self.abnormal_path_edit, True)
-        layout.addWidget(abnormal_widget, 1)
+        self.abnormal_path_label = QLabel()
+        abnormal_widget, self.abnormal_btn = create_path_selector("Abnormal 输出路径", self.abnormal_path_label, True)
+        self.abnormal_btn.clicked.connect(lambda: self._select_abnormal_dir(self.abnormal_path_label))
+        layout.addWidget(abnormal_widget, 0)
 
-        # Parameters Group
-        param_group = QWidget()
-        param_layout = QFormLayout(param_group)
-        param_layout.setContentsMargins(0, 10, 0, 10)
+        # Parameters Group (Compact)
+        param_group = QGroupBox("参数设置")
+        param_layout = QGridLayout(param_group)
+        param_layout.setContentsMargins(5, 5, 5, 5)
+        param_layout.setSpacing(5)
         
         self.patch_width_spin = QSpinBox()
         self.patch_height_spin = QSpinBox()
@@ -717,80 +703,102 @@ class MainWindow(QMainWindow):
         for spin in (self.patch_width_spin, self.patch_height_spin, self.stride_spin):
             spin.setRange(1, 8192)
             spin.setValue(256)
-            # Disable keyboard tracking to prevent updates while typing (avoids lag on intermediate values)
             spin.setKeyboardTracking(False)
         self.stride_spin.setValue(128)
         
         # Debounce timer for parameter changes
         self._param_update_timer = QTimer()
         self._param_update_timer.setSingleShot(True)
-        self._param_update_timer.setInterval(300) # Slightly increased delay
+        self._param_update_timer.setInterval(300)
         self._param_update_timer.timeout.connect(self._update_grid_params)
 
         self.stride_spin.valueChanged.connect(self._schedule_param_update)
         self.patch_width_spin.valueChanged.connect(self._schedule_param_update)
         self.patch_height_spin.valueChanged.connect(self._schedule_param_update)
 
-        self.smart_grid_checkbox = QCheckBox("智能网格 (双色)")
+        self.smart_grid_checkbox = QCheckBox("智能网格")
         self.smart_grid_checkbox.setChecked(False)
         self.smart_grid_checkbox.stateChanged.connect(self._on_smart_grid_changed)
         
-        param_layout.addRow(QLabel("切分宽度"), self.patch_width_spin)
-        param_layout.addRow(QLabel("切分高度"), self.patch_height_spin)
-        param_layout.addRow(QLabel("步长"), self.stride_spin)
-        param_layout.addRow("", self.smart_grid_checkbox)
-        
-        self.patch_count_label = QLabel("预计切分: -")
-        self.patch_count_label.setStyleSheet("color: #888; font-weight: bold;")
-        param_layout.addRow(self.patch_count_label)
+        # Row 0: Patch Size
+        param_layout.addWidget(QLabel("尺寸(WxH):"), 0, 0)
+        size_layout = QHBoxLayout()
+        size_layout.addWidget(self.patch_width_spin)
+        size_layout.addWidget(QLabel("x"))
+        size_layout.addWidget(self.patch_height_spin)
+        param_layout.addLayout(size_layout, 0, 1)
+
+        # Row 1: Stride & Threshold
+        param_layout.addWidget(QLabel("步长:"), 1, 0)
+        param_layout.addWidget(self.stride_spin, 1, 1)
         
         self.threshold_spin = QSpinBox()
         self.threshold_spin.setRange(0, 100)
         self.threshold_spin.setValue(1)
-        param_layout.addRow(QLabel("缺陷阈值(%)"), self.threshold_spin)
-        
-        layout.addWidget(param_group, 2) # More stretch for params
+        param_layout.addWidget(QLabel("阈值(%):"), 2, 0)
+        param_layout.addWidget(self.threshold_spin, 2, 1)
 
-        # Brush Group
-        brush_group = QWidget()
-        brush_layout = QFormLayout(brush_group)
+        # Row 3: Smart Grid & Patch Count
+        param_layout.addWidget(self.smart_grid_checkbox, 3, 0, 1, 2)
         
-        self.brush_size_slider = QSlider(Qt.Horizontal)
-        self.brush_size_slider.setRange(1, 200)
-        self.brush_size_slider.setValue(24)
-        self.brush_size_slider.valueChanged.connect(self._on_brush_size_changed)
-        brush_layout.addRow(QLabel("笔刷大小"), self.brush_size_slider)
+        self.patch_count_label = QLabel("预计: -")
+        self.patch_count_label.setStyleSheet("color: #888; font-weight: bold;")
+        param_layout.addWidget(self.patch_count_label, 4, 0, 1, 2)
         
+        layout.addWidget(param_group, 0) # No stretch
+        
+        # Mask Opacity
+        opacity_layout = QHBoxLayout()
+        opacity_layout.setContentsMargins(0, 0, 0, 0)
         self.mask_opacity_slider = QSlider(Qt.Horizontal)
         self.mask_opacity_slider.setRange(0, 100)
         self.mask_opacity_slider.setValue(50)
         self.mask_opacity_slider.valueChanged.connect(self._on_mask_opacity_changed)
-        brush_layout.addRow(QLabel("Mask 透明度"), self.mask_opacity_slider)
-        
-        layout.addWidget(brush_group, 1)
+        opacity_layout.addWidget(QLabel("透明度:"))
+        opacity_layout.addWidget(self.mask_opacity_slider)
+        layout.addLayout(opacity_layout)
 
-        # Actions Group
-        action_group = QWidget()
-        action_layout = QVBoxLayout(action_group)
+        # Actions Group (Compact)
+        action_group = QGroupBox("操作")
+        action_layout = QGridLayout(action_group)
+        action_layout.setContentsMargins(5, 5, 5, 5)
+        action_layout.setSpacing(5)
         
-        self.save_mask_checkbox = QCheckBox("同步保存 Mask")
-        action_layout.addWidget(self.save_mask_checkbox)
+        self.open_image_btn = QPushButton("打开图片/文件夹")
+        self.open_image_btn.clicked.connect(self._open_image)
         
-        self.clear_mask_button = QPushButton("清除所有")
+        self.clear_mask_button = QPushButton("清除")
         self.clear_mask_button.clicked.connect(self.canvas.clear_mask)
-        action_layout.addWidget(self.clear_mask_button)
         
-        self.slice_button = QPushButton("执行切分 (Slice)")
-        self.next_button = QPushButton("下一张 (Next)")
-        self.slice_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding) # Expand vertically
-        self.next_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        action_layout.addWidget(self.open_image_btn, 0, 0)
+        action_layout.addWidget(self.clear_mask_button, 0, 1)
+        
+        self.slice_button = QPushButton("切分")
         self.slice_button.clicked.connect(self._on_slice)
-        self.next_button.clicked.connect(self._on_next_image)
         
-        action_layout.addWidget(self.slice_button)
-        action_layout.addWidget(self.next_button)
+        action_layout.addWidget(self.slice_button, 1, 0, 1, 2)
         
-        layout.addWidget(action_group, 2)
+        layout.addWidget(action_group, 0)
+        
+        # Mini Map (Canvas)
+        # Add a label for clarity
+        self.current_image_label = QLabel("当前图片: -")
+        self.current_image_label.setStyleSheet("color: #FFD700; font-weight: bold; font-size: 14px;") # Gold color
+        self.current_image_label.setAlignment(Qt.AlignCenter)
+        self.current_image_label.setWordWrap(True)
+        layout.addWidget(self.current_image_label)
+        
+        layout.addWidget(QLabel("检视窗格导航 (点击方格可跳转):"))
+        
+        # Configure Canvas to be small but usable
+        self.canvas.setMinimumSize(250, 250)
+        # Remove fixed maximum size if we want it to stretch with panel width,
+        # but better to keep it square-ish or proportional.
+        # Let's just set a reasonable minimum height.
+        self.canvas.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.canvas.canvas_clicked.connect(self._on_canvas_clicked)
+        
+        layout.addWidget(self.canvas, 1) # Give it some stretch space
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -877,6 +885,20 @@ class MainWindow(QMainWindow):
         if folder:
             line_edit.setText(os.path.normpath(folder))
 
+    def _select_normal_dir(self, label_widget: QLabel):
+        folder = QFileDialog.getExistingDirectory(self, "选择Normal输出文件夹", label_widget.text())
+        if folder:
+            norm_path = os.path.normpath(folder)
+            label_widget.setText(norm_path)
+            self.project_manager.normal_dir = norm_path
+
+    def _select_abnormal_dir(self, label_widget: QLabel):
+        folder = QFileDialog.getExistingDirectory(self, "选择Abnormal输出文件夹", label_widget.text())
+        if folder:
+            norm_path = os.path.normpath(folder)
+            label_widget.setText(norm_path)
+            self.project_manager.abnormal_dir = norm_path
+
     def _open_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -890,11 +912,24 @@ class MainWindow(QMainWindow):
         # Normalize path separators
         path = os.path.normpath(path)
         folder = os.path.dirname(path)
+        filename = os.path.basename(path)
         
+        # Update source path label
+        self.source_path_label.setText(folder)
+        
+        # Natural sort for images
+        def natural_key(text):
+            return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', text)]
+
+        files = [
+            name for name in os.listdir(folder)
+            if name.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"))
+        ]
+        files.sort(key=natural_key)
+
         self._image_list = [
             os.path.normpath(os.path.join(folder, name))
-            for name in sorted(os.listdir(folder))
-            if name.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"))
+            for name in files
         ]
         
         # Update Project Manager
@@ -914,24 +949,33 @@ class MainWindow(QMainWindow):
                 self._image_index = 0
 
         self._load_current_image()
-        self.normal_path_edit.setText(os.path.join(folder, "Normal"))
-        self.abnormal_path_edit.setText(os.path.join(folder, "Abnormal"))
+        
+        # Auto-set Normal/Abnormal paths if not set or user wants convenience
+        normal_dir = os.path.join(folder, "Normal")
+        abnormal_dir = os.path.join(folder, "Abnormal")
+        
+        self.project_manager.normal_dir = normal_dir
+        self.project_manager.abnormal_dir = abnormal_dir
+        
+        self.normal_path_label.setText(normal_dir)
+        self.abnormal_path_label.setText(abnormal_dir)
 
     def _schedule_param_update(self):
         self._param_update_timer.start()
 
     def _update_grid_params(self):
-        self.canvas.set_patch_size(self.patch_width_spin.value(), self.patch_height_spin.value())
-        self.canvas.set_stride(self.stride_spin.value())
+        # Grid should visualize the Unit Modules (Stride x Stride), not the Patches
+        stride = self.stride_spin.value()
+        self.canvas.set_patch_size(stride, stride)
+        self.canvas.set_stride(stride)
         self._update_patch_count_label()
+        self._init_patch_review()
 
     def _update_patch_count_label(self):
+        # Count Unit Modules
         rows, cols = self.canvas.get_patch_counts()
         total = rows * cols
-        self.patch_count_label.setText(f"预计切分: {cols} x {rows} = {total} 张")
-
-    def _on_brush_size_changed(self, value: int):
-        self.canvas.set_brush_size(value)
+        self.patch_count_label.setText(f"单元总数: {cols} x {rows} = {total} 个")
 
     def _on_mask_opacity_changed(self, value: int):
         self.canvas.set_mask_opacity(value / 100.0)
@@ -941,6 +985,13 @@ class MainWindow(QMainWindow):
             return
         path = self._image_list[self._image_index]
         self._current_image_path = path
+        
+        # Update current image label
+        filename = os.path.basename(path)
+        current_idx = self._image_index + 1
+        total_count = len(self._image_list)
+        self.current_image_label.setText(f"当前图片: {filename} ({current_idx}/{total_count})")
+        
         self.canvas.load_image(path)
         
         # Restore mask from ProjectManager
@@ -948,7 +999,7 @@ class MainWindow(QMainWindow):
         if mask is not None:
             self.canvas.set_mask(mask)
             
-        self.source_path_edit.setText(path)
+        self.source_path_label.setText(path)
         
         # Fix for Chinese path reading in OpenCV (Windows)
         try:
@@ -959,6 +1010,23 @@ class MainWindow(QMainWindow):
             
         # Update patch count immediately when image loaded
         self._update_patch_count_label()
+        
+        # Initialize patch review
+        self._init_patch_review()
+        
+        # Filter gallery to show only current image's patches
+        self._filter_gallery_by_current_image()
+
+    def _on_prev_image(self):
+        if not self._image_list:
+            return
+        
+        # Save current mask
+        if self._current_image_path:
+            self.project_manager.set_mask(self._current_image_path, self.canvas.get_mask())
+            
+        self._image_index = max(self._image_index - 1, 0)
+        self._load_current_image()
 
     def _on_next_image(self):
         if not self._image_list:
@@ -977,9 +1045,8 @@ class MainWindow(QMainWindow):
             "patch_height": self.patch_height_spin.value(),
             "stride": self.stride_spin.value(),
             "threshold": self.threshold_spin.value(),
-            "save_mask": self.save_mask_checkbox.isChecked(),
-            "normal_dir": self.normal_path_edit.text(),
-            "abnormal_dir": self.abnormal_path_edit.text()
+            "normal_dir": self.normal_path_label.text(),
+            "abnormal_dir": self.abnormal_path_label.text()
         }
 
     def _apply_config(self, config):
@@ -989,11 +1056,12 @@ class MainWindow(QMainWindow):
         self.patch_height_spin.setValue(config.get("patch_height", 256))
         self.stride_spin.setValue(config.get("stride", 128))
         self.threshold_spin.setValue(config.get("threshold", 1))
-        self.save_mask_checkbox.setChecked(config.get("save_mask", False))
         if "normal_dir" in config:
-            self.normal_path_edit.setText(config["normal_dir"])
+            self.normal_path_label.setText(config["normal_dir"])
+            self.project_manager.normal_dir = config["normal_dir"]
         if "abnormal_dir" in config:
-            self.abnormal_path_edit.setText(config["abnormal_dir"])
+            self.abnormal_path_label.setText(config["abnormal_dir"])
+            self.project_manager.abnormal_dir = config["abnormal_dir"]
 
     def _on_new_project(self):
         self.project_manager = ProjectManager()
@@ -1091,11 +1159,11 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         if source_type == "normal":
             action = menu.addAction("移动到 Abnormal")
-            target_dir = self.abnormal_path_edit.text()
+            target_dir = self.project_manager.abnormal_dir
             target_list = self.abnormal_list
         else:
             action = menu.addAction("移动到 Normal")
-            target_dir = self.normal_path_edit.text()
+            target_dir = self.project_manager.normal_dir
             target_list = self.normal_list
             
         action.triggered.connect(lambda: self._move_gallery_item(item, list_widget, target_list, target_dir))
@@ -1119,17 +1187,13 @@ class MainWindow(QMainWindow):
         row = source_list.row(item)
         source_list.takeItem(row)
         
-        new_item = QListWidgetItem(item.icon(), file_name)
-        new_item.setToolTip(target_path)
-        target_list.addItem(new_item)
-
-    def _increase_brush_size(self):
-        val = self.brush_size_slider.value()
-        self.brush_size_slider.setValue(val + 5)
-
-    def _decrease_brush_size(self):
-        val = self.brush_size_slider.value()
-        self.brush_size_slider.setValue(val - 5)
+        # Check if we should add to target list based on filter
+        # Only add if it belongs to current image (prefix match)
+        current_img_name = os.path.splitext(os.path.basename(self._current_image_path))[0]
+        if file_name.startswith(current_img_name):
+            new_item = QListWidgetItem(item.icon(), file_name)
+            new_item.setToolTip(target_path)
+            target_list.addItem(new_item)
 
     def _on_smart_grid_changed(self, state):
         self.canvas.set_smart_grid(self.smart_grid_checkbox.isChecked())
@@ -1147,11 +1211,9 @@ class MainWindow(QMainWindow):
             "patch_height": self.patch_height_spin.value(),
             "stride": self.stride_spin.value(),
             "threshold": self.threshold_spin.value(),
-            "save_mask": self.save_mask_checkbox.isChecked(),
-            "normal_dir": self.normal_path_edit.text(),
-            "abnormal_dir": self.abnormal_path_edit.text(),
+            "normal_dir": self.normal_path_label.text(),
+            "abnormal_dir": self.abnormal_path_label.text(),
             "smart_grid": self.smart_grid_checkbox.isChecked(),
-            "brush_size": self.brush_size_slider.value(),
             "mask_opacity": self.mask_opacity_slider.value()
         }
         try:
@@ -1172,13 +1234,11 @@ class MainWindow(QMainWindow):
             self.patch_height_spin.setValue(config.get("patch_height", 256))
             self.stride_spin.setValue(config.get("stride", 128))
             self.threshold_spin.setValue(config.get("threshold", 1))
-            self.save_mask_checkbox.setChecked(config.get("save_mask", False))
             if "normal_dir" in config:
-                self.normal_path_edit.setText(config["normal_dir"])
+                self.normal_path_label.setText(config["normal_dir"])
             if "abnormal_dir" in config:
-                self.abnormal_path_edit.setText(config["abnormal_dir"])
+                self.abnormal_path_label.setText(config["abnormal_dir"])
             self.smart_grid_checkbox.setChecked(config.get("smart_grid", False))
-            self.brush_size_slider.setValue(config.get("brush_size", 24))
             self.mask_opacity_slider.setValue(config.get("mask_opacity", 50))
         except Exception as e:
             print(f"Error loading global config: {e}")
@@ -1191,13 +1251,20 @@ class MainWindow(QMainWindow):
     def _on_slice(self):
         if self._current_image is None or self._slicer_thread is not None:
             return
-        normal_dir = self.normal_path_edit.text().strip()
-        abnormal_dir = self.abnormal_path_edit.text().strip()
+        
+        # Enforce that all patches must be annotated
+        if self._patch_coords and self._current_patch_index < len(self._patch_coords):
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "警告", "请先完成所有 Patch 的标注！")
+            return
+
+        normal_dir = self.normal_path_label.text().strip()
+        abnormal_dir = self.abnormal_path_label.text().strip()
         if not normal_dir or not abnormal_dir:
             return
         os.makedirs(normal_dir, exist_ok=True)
         os.makedirs(abnormal_dir, exist_ok=True)
-        save_mask = self.save_mask_checkbox.isChecked()
+        save_mask = False
         mask_dir = None
         if save_mask:
             mask_dir = os.path.join(abnormal_dir, "mask")
@@ -1232,9 +1299,182 @@ class MainWindow(QMainWindow):
         self._slicer_thread.finished.connect(self._on_thread_finished)
         self._slicer_thread.start()
 
+    def _init_patch_review(self):
+        self._patch_coords = []
+        self._current_patch_index = 0
+        if self._current_image is None:
+            self._update_patch_view()
+            return
+
+        h, w = self._current_image.shape[:2]
+        # Iterate based on Unit Modules (Stride x Stride)
+        # We tile the image with stride-sized blocks
+        stride = self.stride_spin.value()
+        
+        # Ensure we cover the whole image, even if it's not a perfect multiple
+        # But for annotation grid, it's cleaner to stick to the grid definition
+        for y in range(0, h, stride):
+            for x in range(0, w, stride):
+                # Ensure we don't go out of bounds (though usually we just clip)
+                if y + stride <= h and x + stride <= w:
+                    self._patch_coords.append((x, y))
+                elif y < h and x < w:
+                    # Handle edge cases? For now, let's only include full units or 
+                    # include partials? The user said "5120x5120 image, 512 stride", which is perfect.
+                    # Let's include partials for robustness
+                    self._patch_coords.append((x, y))
+        
+        self.slice_button.setEnabled(False)
+        self._update_patch_view()
+
+    def _update_patch_view(self):
+        if not self._patch_coords or self._current_patch_index >= len(self._patch_coords):
+            if self._patch_coords and self._current_patch_index >= len(self._patch_coords):
+                self.patch_display_label.setText("标注完成")
+                self.patch_info_label.setText(f"进度: {len(self._patch_coords)}/{len(self._patch_coords)}")
+                self.canvas.set_highlight_rect(QRectF())
+                self.slice_button.setEnabled(True)
+                self.btn_no_defect.setEnabled(False)
+                self.btn_defect.setEnabled(False)
+            else:
+                self.patch_display_label.setText("无图片/无单元")
+                self.patch_info_label.setText("进度: -/-")
+                self.btn_no_defect.setEnabled(False)
+                self.btn_defect.setEnabled(False)
+            return
+
+        self.btn_no_defect.setEnabled(True)
+        self.btn_defect.setEnabled(True)
+        self.slice_button.setEnabled(False)
+        
+        x, y = self._patch_coords[self._current_patch_index]
+        # Unit Size = Stride
+        stride = self.stride_spin.value()
+        
+        # Highlight in canvas (Unit Module)
+        # Note: If edge case, width/height might be smaller
+        h_img, w_img = self._current_image.shape[:2]
+        unit_w = min(stride, w_img - x)
+        unit_h = min(stride, h_img - y)
+        
+        self.canvas.set_highlight_rect(QRectF(x, y, unit_w, unit_h))
+        
+        # Extract unit module
+        if self._current_image is not None:
+            patch = self._current_image[y : y + unit_h, x : x + unit_w]
+            # Convert to QPixmap
+            h, w, ch = patch.shape
+            bytes_per_line = ch * w
+            patch_rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+            image = QImage(patch_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(image)
+            
+            # Show in label (ScalableImageLabel handles scaling)
+            self.patch_display_label.setPixmap(pixmap)
+        
+        self.patch_info_label.setText(f"进度: {self._current_patch_index + 1}/{len(self._patch_coords)}")
+
+    def _on_patch_no_defect(self):
+        self._record_patch_annotation(is_defect=False)
+        self._next_patch()
+
+    def _on_patch_defect(self):
+        self._record_patch_annotation(is_defect=True)
+        self._next_patch()
+
+    def _record_patch_annotation(self, is_defect):
+        if self._current_patch_index >= len(self._patch_coords):
+            return
+        
+        x, y = self._patch_coords[self._current_patch_index]
+        stride = self.stride_spin.value()
+        
+        # Fill Unit Module
+        h_img, w_img = self._current_image.shape[:2]
+        unit_w = min(stride, w_img - x)
+        unit_h = min(stride, h_img - y)
+        
+        self.canvas.fill_rect(QRectF(x, y, unit_w, unit_h), 255 if is_defect else 0)
+
+    def _next_patch(self):
+        self._current_patch_index += 1
+        self._update_patch_view()
+        
+    def _on_prev_patch(self):
+        if self._current_patch_index > 0:
+            self._current_patch_index -= 1
+            self._update_patch_view()
+
+    def _on_canvas_clicked(self, x, y):
+        """Navigate to the patch closest to the clicked point."""
+        if not self._patch_coords:
+            return
+
+        # Simple linear search for closest patch/unit
+        # Ideally, we check which unit rect contains the point
+        stride = self.stride_spin.value()
+        h_img, w_img = self._current_image.shape[:2]
+        
+        found_index = -1
+        
+        for i, (px, py) in enumerate(self._patch_coords):
+            # Calculate unit dimensions
+            unit_w = min(stride, w_img - px)
+            unit_h = min(stride, h_img - py)
+            
+            rect = QRectF(px, py, unit_w, unit_h)
+            if rect.contains(x, y):
+                found_index = i
+                break
+        
+        if found_index != -1:
+            self._current_patch_index = found_index
+            self._update_patch_view()
+
     def _on_slice_finished(self, normal_paths, abnormal_paths):
-        self._enqueue_thumbnails(self.normal_list, normal_paths)
-        self._enqueue_thumbnails(self.abnormal_list, abnormal_paths)
+        QMessageBox.information(self, "完成", f"切分完成！\nNormal: {len(normal_paths)}\nAbnormal: {len(abnormal_paths)}")
+        
+        # We need to refresh the gallery, but filtering by current image
+        self._filter_gallery_by_current_image()
+
+    def _filter_gallery_by_current_image(self):
+        """Reload gallery lists but only show patches belonging to the current image."""
+        if not self._current_image_path:
+            self.normal_list.clear()
+            self.abnormal_list.clear()
+            return
+            
+        # Get current image basename without extension
+        # e.g. "image_01.png" -> "image_01"
+        current_name = os.path.splitext(os.path.basename(self._current_image_path))[0]
+        
+        self.normal_list.clear()
+        self.abnormal_list.clear()
+        
+        # Helper to load directory and filter
+        def load_dir(directory, list_widget):
+            if not directory or not os.path.exists(directory):
+                return
+            
+            # Sort by modification time or name? Name usually keeps order
+            try:
+                files = sorted(os.listdir(directory))
+            except Exception:
+                return
+
+            # Collect valid files first
+            valid_files = []
+            for f in files:
+                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                    if f.startswith(current_name):
+                        valid_files.append(os.path.join(directory, f))
+            
+            # Use the thumbnail queue mechanism to load them
+            if valid_files:
+                self._enqueue_thumbnails(list_widget, valid_files)
+
+        load_dir(self.project_manager.normal_dir, self.normal_list)
+        load_dir(self.project_manager.abnormal_dir, self.abnormal_list)
 
     def _on_thread_finished(self):
         self.slice_button.setEnabled(True)
