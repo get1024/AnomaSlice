@@ -67,14 +67,13 @@ pip install pyside6 opencv-python numpy pillow
 在项目根目录下执行：
 
 ```bash
-cd src
 python main.py
 ```
 
 或者直接运行 `dist` 目录下的可执行文件（如果有）：
 
 ```bash
-./dist/ImageSlicer.exe
+./dist/AnomaSlice.exe
 ```
 
 ## 📖 基本使用流程
@@ -114,13 +113,11 @@ python main.py
 
 ```
 AnomaSlice/
-├── src/
-│   └── main.py          # 程序入口与核心逻辑
+├── main.py             # 程序入口与核心逻辑
 ├── dist/
-│   ├── ImageSlicer.exe  # 可执行文件
-│   └── 使用演示.mp4      # 演示视频
-├── intro.md             # 详细需求文档
+│   ├── AnomaSlice.exe  # 可执行文件
 ├── README.md            # 项目说明文档
+├── demo.mp4             # 使用演示视频
 └── ...
 ```
 
