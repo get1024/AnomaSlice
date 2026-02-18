@@ -4,13 +4,13 @@
 
 > **目标**：在尽量减少人工逐张分类工作的前提下，高效构建高质量的工业缺陷检测 / 分割数据集。
 
+## 🖼️ UI 界面
+
+![](./assets/UI-demo.png)
+
 ## 🎥 使用演示 (Demo)
 
-<div align="center">
-  <video src="demo.mp4" width="100%" controls autoplay loop muted></video>
-  <br>
-  <a href="demo.mp4">点击查看演示视频文件</a>
-</div>
+![](./assets/demo.gif)
 
 ## ✨ 功能特性
 
