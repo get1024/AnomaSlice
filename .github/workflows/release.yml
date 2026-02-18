@@ -7,6 +7,9 @@ on:
       - 'v*' # 只有当你推送类似 "v1.0.0" 的标签时，才会触发自动打包
   workflow_dispatch: # 允许你在 GitHub 网页上手动点击运行测试
 
+permissions:
+  contents: write
+
 jobs:
   build-and-release:
     runs-on: windows-latest # 使用最新的 Windows 环境进行打包
