@@ -147,11 +147,11 @@ class BoxCanvasMixin:
         elif self.has_pending_annotation():
             self._position_label_editor()
 
-    def load_image(self, path):
+    def load_image(self, path, image=None):
         self.cancel_pending_annotation()
         self._user_view_adjusted = False
         self.set_annotations([])
-        result = super().load_image(path)
+        result = super().load_image(path, image=image)
         if result:
             self.fit_image()
         return result

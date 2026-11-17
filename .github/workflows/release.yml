@@ -33,15 +33,15 @@ jobs:
         PYTHONUTF8: '1'
       run: python -m unittest discover -s tests -v
 
-    - name: Build portable Windows application
+    - name: Build single-file Windows application
       shell: pwsh
       run: ./build-windows.ps1 -Python (Get-Command python).Source
 
-    - name: Upload portable application
+    - name: Upload single-file application
       uses: actions/upload-artifact@v4
       with:
         name: AnomaSlice-Windows-x64
-        path: dist/AnomaSlice-Windows-x64.zip
+        path: dist/AnomaSlice.exe
         if-no-files-found: error
         
     - name: 发布到 GitHub Releases (Create Release)
@@ -54,6 +54,6 @@ jobs:
         generate_release_notes: true
         make_latest: 'true'
         fail_on_unmatched_files: true
-        files: dist/AnomaSlice-Windows-x64.zip
+        files: dist/AnomaSlice.exe
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # GitHub 自动提供的密钥，无需手动配置

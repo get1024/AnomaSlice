@@ -9,14 +9,14 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import cv2
-import numpy as np
 from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from annotation_store import LabelCatalog
-from main import MainWindow, SlicerThread
+from app_window import MainWindow
+from slicer import SlicerThread, count_mask_pixels
 
 
 class AppWorkflowTests(unittest.TestCase):
@@ -29,7 +29,7 @@ class AppWorkflowTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.config_patch = patch.object(MainWindow, "_get_global_config_path", return_value=str(self.root / "settings.json"))
         self.config_patch.start()
-        self.messages = [patch("main.QMessageBox.warning"), patch("main.QMessageBox.information"), patch("main.QMessageBox.critical")]
+        self.messages = [patch("app_window.QMessageBox.warning"), patch("app_window.QMessageBox.information"), patch("app_window.QMessageBox.critical")]
         for message in self.messages:
             message.start()
         self.window = MainWindow()
@@ -39,7 +39,9 @@ class AppWorkflowTests(unittest.TestCase):
         self.images = []
         for name in ("样本1.png", "样本2.png"):
             path = self.root / name
-            cv2.imencode(".png", np.full((240, 320, 3), 100, np.uint8))[1].tofile(str(path))
+            image = QImage(320, 240, QImage.Format_RGB32)
+            image.fill(QColor(100, 100, 100))
+            self.assertTrue(image.save(str(path)))
             self.images.append(str(path))
         self.window._image_list = self.images
         self.window.project_manager.set_images(self.images)
@@ -94,7 +96,7 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertTrue(self.window._patch_coords)
         self.assertIsNotNone(self.window.canvas.get_mask())
         self.window._on_patch_defect()
-        self.assertGreater(cv2.countNonZero(self.window.canvas.get_mask()), 0)
+        self.assertGreater(count_mask_pixels(self.window.canvas.get_mask()), 0)
         self.window.mode_combo.setCurrentIndex(0)
         self.assertEqual(self.window.canvas.get_annotations(), [])
 
@@ -134,7 +136,7 @@ class AppWorkflowTests(unittest.TestCase):
         before = Path(self.images[0] + ".annotations.json").read_bytes()
         project = self.root / "empty.json"
         project.write_text(json.dumps({"version": "1.1", "images": [], "current_index": -1, "config": {}}), encoding="utf-8")
-        with patch("main.QFileDialog.getOpenFileName", return_value=(str(project), "")):
+        with patch("app_window.QFileDialog.getOpenFileName", return_value=(str(project), "")):
             self.window._on_open_project()
         self.assertIsNone(self.window._current_image_path)
         self.window._on_save_current()
@@ -144,9 +146,13 @@ class AppWorkflowTests(unittest.TestCase):
         normal, abnormal = self.root / "Normal", self.root / "Abnormal"
         normal.mkdir()
         abnormal.mkdir()
-        image = np.zeros((32, 64, 3), np.uint8)
-        mask = np.zeros((32, 64), np.uint8)
-        mask[:, :32] = 255
+        image = QImage(64, 32, QImage.Format_RGB32)
+        image.fill(QColor("black"))
+        mask = QImage(64, 32, QImage.Format_Grayscale8)
+        mask.fill(0)
+        painter = QPainter(mask)
+        painter.fillRect(0, 0, 32, 32, QColor("white"))
+        painter.end()
         worker = SlicerThread(image, mask, 32, 32, 32, .01, str(normal), str(abnormal), False, None, "sample")
         worker.run()
         self.assertEqual([p.name for p in normal.iterdir()], ["sample_32_0.png"])

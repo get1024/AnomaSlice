@@ -19,10 +19,10 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMainWindow
 
 from bbox_canvas import BoxCanvasMixin
-from main import _SliceCanvas
+from image_canvas import SliceCanvas
 
 
-class _TestCanvas(BoxCanvasMixin, _SliceCanvas):
+class _TestCanvas(BoxCanvasMixin, SliceCanvas):
     pass
 
 
@@ -132,7 +132,7 @@ class BoxCanvasTests(unittest.TestCase):
         if original_mask is None:
             self.assertIsNone(self.canvas.get_mask())
         else:
-            self.assertTrue((original_mask == self.canvas.get_mask()).all())
+            self.assertEqual(original_mask, self.canvas.get_mask())
 
     def test_pending_boxes_are_cancelled_without_committing(self):
         self.drag((10, 10), (100, 100))

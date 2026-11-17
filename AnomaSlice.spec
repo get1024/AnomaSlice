@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Portable Windows build: native Qt widgets, no web/QML/video runtime."""
+"""Single-file Windows build using Qt's native image and widget support."""
 
 from pathlib import Path
 
@@ -25,34 +25,66 @@ analysis = Analysis(
         "PySide6.QtMultimediaWidgets",
         "PySide6.QtPdf",
         "PySide6.QtPdfWidgets",
+        "PySide6.QtNetwork",
+        "PySide6.QtOpenGL",
+        "PySide6.QtOpenGLWidgets",
+        "PySide6.QtPrintSupport",
+        "PySide6.QtSql",
+        "PySide6.QtSvg",
+        "PySide6.QtSvgWidgets",
+        "PySide6.QtTest",
+        "PySide6.QtXml",
+        "cv2",
+        "numpy",
+        "PIL",
         "matplotlib",
         "IPython",
         "tkinter",
         "pytest",
+        "ssl",
+        "_ssl",
+        "_hashlib",
     ],
     noarchive=False,
     optimize=1,
 )
 
-# OpenCV's wheel contains a large optional FFmpeg DLL. This application uses
-# only still-image operations, so that video decoder is not distributed.
 # Qt 6.12 on Windows uses the OS-provided ICU (System32/icuuc.dll). An activated
 # conda base environment can cause dependency analysis to collect its unrelated
 # ICU instead; that DLL has version-suffixed exports and breaks QtCore import.
 # Leave ICU to Windows, as the original, unfrozen PySide6 process does.
-analysis.binaries = [
-    entry
-    for entry in analysis.binaries
-    if not Path(entry[0]).name.lower().startswith(("opencv_videoio_ffmpeg", "icudt"))
-    and Path(entry[0]).name.lower() != "icuuc.dll"
+# QFileDialog and QGraphicsView use native/raster widgets. They need neither
+# OpenGL's software fallback nor network, SVG/PDF, TLS or SQL plugins. BMP/PNG
+# are built into Qt; retain the still-image codecs used by the image picker.
+def keep_binary(entry):
+    destination = Path(entry[0])
+    filename = destination.name.lower()
+    parts = {part.lower() for part in destination.parts}
+    if filename.startswith(("opencv_videoio_ffmpeg", "icudt")) or filename == "icuuc.dll":
+        return False
+    if filename == "opengl32sw.dll":
+        return False
+    if "plugins" in parts:
+        if "platforms" in parts:
+            return filename in {"qwindows.dll", "qoffscreen.dll"}
+        if "imageformats" in parts:
+            return filename in {"qjpeg.dll", "qgif.dll", "qico.dll", "qtiff.dll"}
+        return False
+    return True
+
+
+analysis.binaries = [entry for entry in analysis.binaries if keep_binary(entry)]
+analysis.datas = [
+    entry for entry in analysis.datas
+    if "translations" not in {part.lower() for part in Path(entry[0]).parts}
 ]
 
 pyz = PYZ(analysis.pure)
 exe = EXE(
     pyz,
     analysis.scripts,
-    [],
-    exclude_binaries=True,
+    analysis.binaries,
+    analysis.datas,
     name="AnomaSlice",
     debug=False,
     bootloader_ignore_signals=False,
@@ -60,12 +92,4 @@ exe = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
-)
-collection = COLLECT(
-    exe,
-    analysis.binaries,
-    analysis.datas,
-    strip=False,
-    upx=False,
-    name="AnomaSlice",
 )

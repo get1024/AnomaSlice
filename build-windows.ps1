@@ -1,8 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Python,
-    [switch]$InstallDependencies,
-    [switch]$SkipZip
+    [switch]$InstallDependencies
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,9 +34,9 @@ $Python = (Resolve-Path -LiteralPath $Python).Path
 # fixed targets stay below this checkout before enabling --noconfirm.
 $distDirectory = [System.IO.Path]::GetFullPath((Join-Path $projectDirectory 'dist'))
 $buildDirectory = [System.IO.Path]::GetFullPath((Join-Path $projectDirectory 'build\windows'))
-$applicationDirectory = Join-Path $distDirectory 'AnomaSlice'
+$applicationExe = Join-Path $distDirectory 'AnomaSlice.exe'
 $workspacePrefix = $projectDirectory.TrimEnd('\') + '\'
-foreach ($target in @($distDirectory, (Join-Path $projectDirectory 'build'), $buildDirectory, $applicationDirectory)) {
+foreach ($target in @($distDirectory, (Join-Path $projectDirectory 'build'), $buildDirectory, $applicationExe)) {
     if (-not $target.StartsWith($workspacePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing a build outside this checkout: $target"
     }
@@ -58,29 +57,34 @@ try {
         & $Python -m pip install -r (Join-Path $projectDirectory 'requirements-build.txt')
         if ($LASTEXITCODE -ne 0) { throw 'Installing build dependencies failed.' }
     }
-    & $Python -c 'import struct, sys; import PyInstaller, PySide6.QtWidgets, cv2, numpy; assert sys.version_info >= (3, 12), "Use Python 3.12 or newer"; assert struct.calcsize("P") == 8, "Use 64-bit Python"; print("Building with", sys.executable, "PyInstaller", PyInstaller.__version__)'
+    & $Python -c 'import struct, sys; import PyInstaller, PySide6.QtWidgets; assert sys.version_info >= (3, 12), "Use Python 3.12 or newer"; assert struct.calcsize("P") == 8, "Use 64-bit Python"; print("Building with", sys.executable, "PyInstaller", PyInstaller.__version__)'
     if ($LASTEXITCODE -ne 0) {
         throw 'Build dependencies are unavailable. Re-run with -InstallDependencies.'
     }
     & $Python -m PyInstaller --noconfirm --clean --distpath $distDirectory --workpath $buildDirectory (Join-Path $projectDirectory 'AnomaSlice.spec')
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed.' }
 
-    $applicationExe = Join-Path $applicationDirectory 'AnomaSlice.exe'
     if (-not (Test-Path -LiteralPath $applicationExe -PathType Leaf)) {
         throw "Expected executable was not produced: $applicationExe"
     }
-    # Verify the frozen runtime without relying on the developer's conda PATH.
-    # --smoke-test opens the main window offscreen and exits its event loop.
+    # Copy just the EXE into an empty directory before launching it. This checks
+    # the same distribution the recipient receives, with no adjacent source or
+    # runtime files and no reliance on the developer's conda PATH.
+    $smokeDirectory = Join-Path $buildDirectory ('standalone-smoke-' + [System.Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $smokeDirectory | Out-Null
+    $smokeExe = Join-Path $smokeDirectory 'AnomaSlice.exe'
+    Copy-Item -LiteralPath $applicationExe -Destination $smokeExe
     $smokeStart = New-Object System.Diagnostics.ProcessStartInfo
-    $smokeStart.FileName = $applicationExe
+    $smokeStart.FileName = $smokeExe
     $smokeStart.Arguments = '--smoke-test'
-    $smokeStart.WorkingDirectory = $applicationDirectory
+    $smokeStart.WorkingDirectory = $smokeDirectory
     $smokeStart.UseShellExecute = $false
     $smokeStart.CreateNoWindow = $true
     $smokeStart.EnvironmentVariables['QT_QPA_PLATFORM'] = 'offscreen'
     $smokeStart.EnvironmentVariables['PATH'] = "$env:SystemRoot\System32;$env:SystemRoot"
     $smokeStart.EnvironmentVariables.Remove('PYTHONPATH')
     $smokeStart.EnvironmentVariables.Remove('PYTHONHOME')
+    $smokeTimer = [System.Diagnostics.Stopwatch]::StartNew()
     $smokeProcess = [System.Diagnostics.Process]::Start($smokeStart)
     if (-not $smokeProcess.WaitForExit(30000)) {
         $smokeProcess.Kill()
@@ -89,15 +93,23 @@ try {
     if ($smokeProcess.ExitCode -ne 0) {
         throw "The frozen application startup check failed (exit $($smokeProcess.ExitCode))."
     }
-    Write-Host 'Frozen application startup check passed (isolated PATH).'
-    $bytes = (Get-ChildItem -LiteralPath $applicationDirectory -Recurse -File | Measure-Object -Property Length -Sum).Sum
-    Write-Host ('Portable application: {0} ({1:N1} MiB)' -f $applicationExe, ($bytes / 1MB))
-    if (-not $SkipZip) {
-        $archive = Join-Path $distDirectory 'AnomaSlice-Windows-x64.zip'
-        Compress-Archive -LiteralPath $applicationDirectory -DestinationPath $archive -CompressionLevel Optimal -Force
-        Write-Host "Distribution ZIP: $archive"
+    $smokeTimer.Stop()
+    Remove-Item -LiteralPath $smokeExe
+    Remove-Item -LiteralPath $smokeDirectory
+    Write-Host 'Single EXE startup check passed (empty directory and isolated PATH).'
+    $bytes = (Get-Item -LiteralPath $applicationExe).Length
+    $report = [ordered]@{
+        executable = $applicationExe
+        singleFile = $true
+        applicationMiB = [Math]::Round($bytes / 1MB, 2)
+        standaloneCopyExit = $smokeProcess.ExitCode
+        isolatedPath = $true
+        smokeSeconds = [Math]::Round($smokeTimer.Elapsed.TotalSeconds, 2)
+        sha256 = (Get-FileHash -LiteralPath $applicationExe -Algorithm SHA256).Hash
     }
-    Write-Host 'Keep AnomaSlice.exe and its _internal folder together. Python is not required on the target computer.'
+    $report | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $buildDirectory 'single-exe-report.json') -Encoding UTF8
+    Write-Host ('Single-file application: {0} ({1:N1} MiB)' -f $applicationExe, ($bytes / 1MB))
+    Write-Host 'Distribute AnomaSlice.exe directly. No adjacent runtime folder or Python installation is required.'
 }
 finally {
     Pop-Location

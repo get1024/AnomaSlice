@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from main import ProjectManager
+from project_store import ProjectManager
 
 
 class ProjectLoadingTests(unittest.TestCase):
