@@ -2,3 +2,8 @@ build/
 dist/
 **/__pycache__/
 .DS_Store
+
+# Local development environment and machine-specific launcher
+environment.local.yml
+requirements-local.lock.txt
+Start-AnomaSlice.cmd

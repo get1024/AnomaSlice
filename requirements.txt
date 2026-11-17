@@ -1,4 +1,1 @@
-PySide6
-opencv-python
-numpy
-pyinstaller
+-r requirements-build.txt

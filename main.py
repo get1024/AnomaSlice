@@ -36,7 +36,13 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QGridLayout,
     QMessageBox,
+    QComboBox,
+    QStackedWidget,
 )
+
+from annotation_store import AnnotationStore, LabelCatalog
+from bbox_canvas import BoxCanvasMixin
+from label_dialog import LabelDialog
 
 class ScalableImageLabel(QLabel):
     def __init__(self, parent=None):
@@ -176,7 +182,7 @@ class GridItem(QGraphicsItem):
             painter.drawRect(self._highlight_rect)
 
 
-class CanvasWidget(QGraphicsView):
+class _SliceCanvas(QGraphicsView):
     # Signal to notify when a point is clicked (x, y)
     canvas_clicked = Signal(float, float)
 
@@ -219,7 +225,7 @@ class CanvasWidget(QGraphicsView):
         if not self._pixmap_item.pixmap().isNull():
             self.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
 
-    def load_image(self, path: str):
+    def wheelEvent(self, event):
         # Standard behavior: Ctrl + Wheel for zoom.
         if event.modifiers() & Qt.ControlModifier:
             zoom_in = event.angleDelta().y() > 0
@@ -237,12 +243,18 @@ class CanvasWidget(QGraphicsView):
         rect = QRectF(pixmap.rect())
         self._scene.setSceneRect(rect)
         self._grid_item.set_rect(rect)
-        self._mask = np.zeros((pixmap.height(), pixmap.width()), dtype=np.uint8)
+        self._mask = None  # Rectangle-only work does not need a full-resolution mask.
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._update_mask_item()
         self._fit_in_view() # Use the helper method
         return True
+
+    def ensure_slice_mask(self):
+        pixmap = self._pixmap_item.pixmap()
+        if self._mask is None and not pixmap.isNull():
+            self._mask = np.zeros((pixmap.height(), pixmap.width()), dtype=np.uint8)
+            self._update_mask_item()
 
     def set_stride(self, stride: int):
         self._grid_item.set_stride(stride)
@@ -305,6 +317,7 @@ class CanvasWidget(QGraphicsView):
     def _update_mask_item(self):
         if self._mask is None:
             self._mask_item.setPixmap(QPixmap())
+            self._mask_rgba = None
             return
         h, w = self._mask.shape
         self._mask_rgba = np.zeros((h, w, 4), dtype=np.uint8)
@@ -338,11 +351,16 @@ class CanvasWidget(QGraphicsView):
 
 
 
+class CanvasWidget(BoxCanvasMixin, _SliceCanvas):
+    """Shared image canvas for rectangle annotation and the original slicer."""
+
+
 class ProjectManager:
     def __init__(self):
         self.project_path = None
         self.images = []
         self.masks = {} # map path -> mask (numpy array)
+        self.annotations = {}
         self.current_index = -1
         self.config = {}
         self.normal_dir = None
@@ -379,11 +397,12 @@ class ProjectManager:
             mask_paths_map[img_path] = os.path.relpath(save_path, base_dir)
             
         data = {
-            "version": "1.0",
+            "version": "1.1",
             "images": self.images,
             "current_index": current_index,
             "config": config,
             "masks": mask_paths_map,
+            "annotations": self.annotations,
             "normal_files": normal_files if normal_files is not None else [],
             "abnormal_files": abnormal_files if abnormal_files is not None else []
         }
@@ -395,25 +414,101 @@ class ProjectManager:
     def load_project(self, json_path):
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
-        self.project_path = json_path
-        self.images = data.get("images", [])
-        self.current_index = data.get("current_index", -1)
-        self.config = data.get("config", {})
-        normal_files = data.get("normal_files", [])
-        abnormal_files = data.get("abnormal_files", [])
-        
-        base_dir = os.path.dirname(json_path)
+
+        # Validate into local variables before replacing the active project.
+        # In particular, a per-image *.annotations.json is not a project file.
+        if not isinstance(data, dict) or "images" not in data or "config" not in data:
+            raise ValueError("这不是 AnomaSlice 工程文件；图片标注 JSON 请通过打开对应图片载入。")
+        if data.get("version") not in ("1.0", "1.1"):
+            raise ValueError("不支持的 AnomaSlice 工程版本。")
+
+        def path_list(value, description):
+            if not isinstance(value, list) or any(
+                not isinstance(path, str) or not path.strip() for path in value
+            ):
+                raise ValueError(f"工程中的{description}必须是有效路径列表。")
+            return list(value)
+
+        images = path_list(data["images"], "图片")
+        current_index = data.get("current_index", -1)
+        if isinstance(current_index, bool) or not isinstance(current_index, int):
+            raise ValueError("工程中的当前图片编号必须是整数。")
+        if (images and not 0 <= current_index < len(images)) or (not images and current_index != -1):
+            raise ValueError("工程中的当前图片编号超出图片列表范围。")
+
+        config = data["config"]
+        if not isinstance(config, dict):
+            raise ValueError("工程参数 config 必须是 JSON 对象。")
+        config = dict(config)
+        for key, minimum, maximum in (
+            ("patch_width", 1, 8192), ("patch_height", 1, 8192),
+            ("stride", 1, 8192), ("threshold", 0, 100),
+            ("mask_opacity", 0, 100), ("mode", 0, 1),
+        ):
+            if key in config:
+                value = config[key]
+                if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+                    raise ValueError(f"工程参数 {key} 必须是 {minimum} 至 {maximum} 的整数。")
+        for key in ("normal_dir", "abnormal_dir"):
+            if key in config and not isinstance(config[key], str):
+                raise ValueError(f"工程参数 {key} 必须是路径文字。")
+        if "smart_grid" in config and not isinstance(config["smart_grid"], bool):
+            raise ValueError("工程参数 smart_grid 必须是布尔值。")
+        if "label_catalog" in config:
+            config["label_catalog"] = LabelCatalog(config["label_catalog"]).to_list()
+
+        annotations = data.get("annotations", {})
+        if not isinstance(annotations, dict):
+            raise ValueError("工程中的 annotations 必须是 JSON 对象。")
+        validated_annotations = {}
+        for image_path, boxes in annotations.items():
+            if not isinstance(image_path, str) or not image_path.strip() or not isinstance(boxes, list):
+                raise ValueError("工程中的标注必须使用图片路径对应标注框列表。")
+            validated_boxes = []
+            for box in boxes:
+                if not isinstance(box, dict) or not isinstance(box.get("label"), str) or not box["label"].strip():
+                    raise ValueError("工程中的标注框缺少有效标签。")
+                bbox = box.get("bbox")
+                if not isinstance(bbox, list) or len(bbox) != 4 or any(
+                    isinstance(value, bool) or not isinstance(value, int) for value in bbox
+                ):
+                    raise ValueError("工程中的标注框坐标必须是 [x, y, 宽, 高] 整数列表。")
+                if bbox[0] < 0 or bbox[1] < 0 or bbox[2] <= 0 or bbox[3] <= 0:
+                    raise ValueError("工程中的标注框起点不能为负，宽高必须大于零。")
+                validated_boxes.append({"label": box["label"].strip(), "bbox": list(bbox)})
+            # Bounds are checked against the decoded image when it is opened.
+            validated_annotations[image_path] = validated_boxes
+
+        normal_files = path_list(data.get("normal_files", []), "Normal 结果")
+        abnormal_files = path_list(data.get("abnormal_files", []), "Abnormal 结果")
         mask_map = data.get("masks", {})
-        self.masks = {}
-        
+        if not isinstance(mask_map, dict) or any(
+            not isinstance(image_path, str) or not image_path.strip()
+            or not isinstance(mask_path, str) or not mask_path.strip()
+            for image_path, mask_path in mask_map.items()
+        ):
+            raise ValueError("工程中的 masks 必须使用图片路径对应掩膜路径。")
+        base_dir = os.path.dirname(json_path)
+        masks = {}
         for img_path, mask_rel_path in mask_map.items():
             full_path = os.path.join(base_dir, mask_rel_path)
             if os.path.exists(full_path):
-                mask = cv2.imdecode(np.fromfile(full_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-                if mask is not None:
-                    self.masks[img_path] = mask
-        
+                try:
+                    mask = cv2.imdecode(np.fromfile(full_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+                except (OSError, cv2.error) as error:
+                    raise ValueError(f"无法读取工程掩膜：{full_path}") from error
+                if mask is None:
+                    raise ValueError(f"无法解码工程掩膜：{full_path}")
+                masks[img_path] = mask
+
+        self.project_path = json_path
+        self.images = images
+        self.current_index = current_index
+        self.config = config
+        self.annotations = validated_annotations
+        self.masks = masks
+        self.normal_dir = config.get("normal_dir")
+        self.abnormal_dir = config.get("abnormal_dir")
         return self.current_index, self.config, normal_files, abnormal_files
 
 
@@ -483,12 +578,13 @@ class SlicerThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Industrial Image Slicer & Annotator")
+        self.setWindowTitle("AnomaSlice — 图片标注与切图")
         self.resize(1400, 900)
         self.project_manager = ProjectManager()
-        self._create_actions()
-        self._build_ui()
-        self._load_global_config()
+        self.label_catalog = LabelCatalog([])
+        self.annotation_store = AnnotationStore()
+        self._boxes_dirty = False
+        self._annotation_load_error = False
         self._current_image_path = None
         self._current_image = None
         self._image_list = []
@@ -498,6 +594,13 @@ class MainWindow(QMainWindow):
         self._slicer_thread = None
         self._patch_coords = []
         self._current_patch_index = 0
+        self._create_actions()
+        self._build_ui()
+        self.canvas.resolve_label = self.label_catalog.resolve
+        self.canvas.annotations_changed = self._on_annotations_changed
+        self.canvas.new_label_committed = self._on_label_committed
+        self._load_global_config()
+        self._set_mode(0)
 
 
     def _create_actions(self):
@@ -511,7 +614,7 @@ class MainWindow(QMainWindow):
         
         self.save_project_action = QAction("保存工程", self)
         self.save_project_action.setShortcut("Ctrl+S")
-        self.save_project_action.triggered.connect(self._on_save_project)
+        self.save_project_action.triggered.connect(self._on_save_current)
         
         self.save_project_as_action = QAction("工程另存为...", self)
         self.save_project_as_action.triggered.connect(self._on_save_project_as)
@@ -519,14 +622,18 @@ class MainWindow(QMainWindow):
         # Edit Actions
         self.undo_action = QAction("撤销", self)
         self.undo_action.setShortcut("Ctrl+Z")
-        self.undo_action.triggered.connect(lambda: self.canvas.undo())
+        self.undo_action.triggered.connect(self._undo_current)
 
         self.redo_action = QAction("重做", self)
         self.redo_action.setShortcut("Ctrl+Shift+Z")
-        self.redo_action.triggered.connect(lambda: self.canvas.redo())
+        self.redo_action.triggered.connect(self._redo_current)
 
         # Initialize Canvas early for signal connections
         self.canvas = CanvasWidget()
+
+        self.open_image_action = QAction("打开图片", self)
+        self.open_image_action.setShortcut("Ctrl+I")
+        self.open_image_action.triggered.connect(self._open_image)
 
         self.slice_and_next_action = QAction("Slice and Next", self)
         self.slice_and_next_action.setShortcut("Return")
@@ -537,6 +644,8 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("文件")
+        file_menu.addAction(self.open_image_action)
+        file_menu.addSeparator()
         file_menu.addAction(self.new_project_action)
         file_menu.addAction(self.open_project_action)
         file_menu.addAction(self.save_project_action)
@@ -552,16 +661,26 @@ class MainWindow(QMainWindow):
         
         # 1. Left Panel
         self.control_panel = self._build_control_panel()
+        self.annotation_panel = self._build_annotation_panel()
+        self.left_stack = QStackedWidget()
+        self.left_stack.addWidget(self.annotation_panel)
+        self.left_stack.addWidget(self.control_panel)
         
         # 2. Center Panel (Patch Viewer Only)
         self.patch_viewer = self._build_patch_viewer()
         self.patch_viewer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.annotation_view = QWidget()
+        self._annotation_canvas_layout = QVBoxLayout(self.annotation_view)
+        self._annotation_canvas_layout.setContentsMargins(0, 0, 0, 0)
+        self.center_stack = QStackedWidget()
+        self.center_stack.addWidget(self.annotation_view)
+        self.center_stack.addWidget(self.patch_viewer)
         
         # 3. Gallery (Right)
         self.gallery = self._build_gallery()
 
-        self.main_splitter.addWidget(self.control_panel)
-        self.main_splitter.addWidget(self.patch_viewer)
+        self.main_splitter.addWidget(self.left_stack)
+        self.main_splitter.addWidget(self.center_stack)
         self.main_splitter.addWidget(self.gallery)
         
         # Set stretch factors for main splitter
@@ -572,7 +691,235 @@ class MainWindow(QMainWindow):
         # Set initial sizes
         self.main_splitter.setSizes([350, 1000, 320])
 
-        self.setCentralWidget(self.main_splitter)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(8, 6, 8, 6)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("工作模式"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["框选标注", "切图分类"])
+        self.mode_combo.currentIndexChanged.connect(self._set_mode)
+        top.addWidget(self.mode_combo)
+        top.addStretch()
+        self.image_position_label = QLabel("打开一张图片后，可继续浏览同文件夹中的图片")
+        top.addWidget(self.image_position_label)
+        layout.addLayout(top)
+        layout.addWidget(self.main_splitter, 1)
+        self.setCentralWidget(container)
+        self.statusBar().showMessage("就绪")
+
+    def _build_annotation_panel(self):
+        panel = QWidget()
+        panel.setMinimumWidth(240)
+        panel.setMaximumWidth(330)
+        layout = QVBoxLayout(panel)
+        title = QLabel("人工框选标注")
+        title.setStyleSheet("font-weight: bold; font-size: 18px;")
+        layout.addWidget(title)
+        open_button = QPushButton("打开图片…  (Ctrl+I)")
+        open_button.clicked.connect(self._open_image)
+        layout.addWidget(open_button)
+        self.annotation_image_label = QLabel("尚未打开图片")
+        self.annotation_image_label.setWordWrap(True)
+        self.annotation_image_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.annotation_image_label)
+        classes = QPushButton("缺陷种类与别名…")
+        classes.clicked.connect(self._edit_labels)
+        layout.addWidget(classes)
+        self.catalog_label = QLabel("可直接输入标签，也可先设置种类别名。")
+        self.catalog_label.setWordWrap(True)
+        layout.addWidget(self.catalog_label)
+        self.box_count_label = QLabel("标注框：0")
+        layout.addWidget(self.box_count_label)
+        self.annotation_save_label = QLabel("每次确认后自动保存到图片旁的 JSON 文件。")
+        self.annotation_save_label.setWordWrap(True)
+        layout.addWidget(self.annotation_save_label)
+        fit = QPushButton("适应窗口")
+        fit.clicked.connect(self.canvas.fit_image)
+        layout.addWidget(fit)
+        delete = QPushButton("删除所选框  (Delete)")
+        delete.clicked.connect(self.canvas.delete_selected_annotation)
+        layout.addWidget(delete)
+        undo_row = QHBoxLayout()
+        undo = QPushButton("撤回")
+        undo.clicked.connect(self._undo_current)
+        redo = QPushButton("重做")
+        redo.clicked.connect(self._redo_current)
+        undo_row.addWidget(undo)
+        undo_row.addWidget(redo)
+        layout.addLayout(undo_row)
+        layout.addStretch()
+        help_text = QLabel("滚轮：缩放图片\n左键拖动：画框\n右键拖动：移动图片\nEnter：确认标签　Esc：取消\n单击：选框　双击：改标签\nCtrl+Z：撤回\nCtrl+Shift+Z：重做")
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+        navigation = QHBoxLayout()
+        previous = QPushButton("上一张")
+        previous.clicked.connect(self._on_prev_image)
+        following = QPushButton("下一张")
+        following.clicked.connect(self._on_next_image)
+        navigation.addWidget(previous)
+        navigation.addWidget(following)
+        layout.addLayout(navigation)
+        return panel
+
+    def _set_mode(self, index):
+        annotation = index == 0
+        self.canvas.cancel_pending_annotation()
+        if annotation:
+            self._annotation_canvas_layout.addWidget(self.canvas)
+        else:
+            self._slice_canvas_layout.insertWidget(self._slice_canvas_index, self.canvas, 1)
+        self.left_stack.setCurrentIndex(index)
+        self.center_stack.setCurrentIndex(index)
+        self.gallery.setVisible(not annotation)
+        self.canvas.set_annotation_mode(annotation)
+        if not annotation:
+            self.canvas.ensure_slice_mask()
+        self.canvas._grid_item.setVisible(not annotation)
+        self.canvas._mask_item.setVisible(not annotation)
+        self.slice_and_next_action.setEnabled(not annotation)
+        self.main_splitter.setSizes([270 if annotation else 350, 1000, 0 if annotation else 320])
+        self.canvas.fit_image()
+        if not annotation:
+            self._init_patch_review()
+
+    def _undo_current(self):
+        focus = QApplication.focusWidget()
+        if isinstance(focus, QLineEdit):
+            focus.undo()
+        elif self.mode_combo.currentIndex() == 0:
+            self.canvas.annotation_undo()
+        else:
+            self.canvas.undo()
+
+    def _redo_current(self):
+        focus = QApplication.focusWidget()
+        if isinstance(focus, QLineEdit):
+            focus.redo()
+        elif self.mode_combo.currentIndex() == 0:
+            self.canvas.annotation_redo()
+        else:
+            self.canvas.redo()
+
+    def _on_save_current(self):
+        if self.mode_combo.currentIndex() == 0:
+            if self.canvas.has_pending_annotation():
+                self.statusBar().showMessage("请按 Enter 确认标签，或按 Esc 取消当前框。", 5000)
+                return
+            self._flush_annotations(force=True)
+        else:
+            self._on_save_project()
+
+    def _refresh_catalog(self):
+        self.canvas.resolve_label = self.label_catalog.resolve
+        descriptions = []
+        for record in self.label_catalog.to_list():
+            aliases = ", ".join(record["aliases"])
+            descriptions.append(f'{record["name"]}  ←  {aliases}' if aliases else record["name"])
+        self.catalog_label.setText("\n".join(descriptions) or "可直接输入标签，也可先设置种类别名。")
+
+    def _edit_labels(self):
+        dialog = LabelDialog(self.label_catalog, self)
+        if dialog.exec():
+            self.label_catalog = dialog.catalog
+            self._refresh_catalog()
+            self._save_global_config()
+            if self._current_image_path and not self._annotation_load_error:
+                self._boxes_dirty = True
+                self._flush_annotations()
+
+    def _on_label_committed(self, label):
+        self.label_catalog.add_label(label)
+        self._refresh_catalog()
+        self._save_global_config()
+
+    def _on_annotations_changed(self, boxes):
+        if not self._current_image_path or self._annotation_load_error:
+            return
+        self.project_manager.annotations[self._current_image_path] = boxes
+        self.box_count_label.setText(f"标注框：{len(boxes)}")
+        self._boxes_dirty = True
+        self._flush_annotations()
+
+    def _flush_annotations(self, force=False):
+        if not self._current_image_path or self._current_image is None:
+            return True
+        if self._annotation_load_error:
+            return True  # Keep unreadable sidecars untouched; navigation remains available.
+        if not self._boxes_dirty and not force:
+            return True
+        h, w = self._current_image.shape[:2]
+        try:
+            boxes = self.canvas.get_annotations()
+            saved_path = self.annotation_store.save(
+                self._current_image_path, w, h, boxes, self.label_catalog.to_list()
+            )
+        except (OSError, ValueError) as error:
+            self.annotation_save_label.setText(f"保存失败：{error}")
+            self.statusBar().showMessage("标注尚未保存，请检查图片目录的写入权限后按 Ctrl+S 重试。")
+            return False
+        self.project_manager.annotations[self._current_image_path] = boxes
+        self._boxes_dirty = False
+        self.annotation_save_label.setText("已自动保存 ✓")
+        self.annotation_save_label.setToolTip(str(saved_path))
+        self.statusBar().showMessage(f"已保存 {len(boxes)} 个标注框", 3000)
+        return True
+
+    def _prepare_image_change(self):
+        self.canvas.cancel_pending_annotation()
+        if not self._flush_annotations():
+            QMessageBox.warning(self, "标注尚未保存", "保存失败，当前图片已保留。请检查写入权限后按 Ctrl+S 重试。")
+            return False
+        if self._current_image_path:
+            self.project_manager.set_mask(self._current_image_path, self.canvas.get_mask())
+        return True
+
+    def _load_annotations(self, path, width, height):
+        self._boxes_dirty = False
+        self._annotation_load_error = False
+        self.canvas.setEnabled(True)
+        try:
+            document = self.annotation_store.load(path, width, height)
+            boxes = document["boxes"]
+            if not os.path.exists(path + ".annotations.json"):
+                boxes = self.project_manager.annotations.get(path, boxes)
+                boxes = self.annotation_store.validate_boxes(boxes, width, height)
+            # Merge portable labels, preserving existing bindings when aliases conflict.
+            for record in document.get("label_catalog", []):
+                records = self.label_catalog.to_list()
+                by_name = {r["name"]: r for r in records}
+                if record["name"] not in by_name:
+                    try:
+                        self.label_catalog.add_label(record["name"])
+                    except ValueError:
+                        self.statusBar().showMessage("导入类别与当前别名冲突，已有框的标签仍原样保留。", 7000)
+                        continue
+                for alias in record["aliases"]:
+                    records = self.label_catalog.to_list()
+                    target = next(r for r in records if r["name"] == record["name"])
+                    if alias in target["aliases"]:
+                        continue
+                    target["aliases"].append(alias)
+                    try:
+                        self.label_catalog = LabelCatalog(records)
+                    except ValueError:
+                        self.statusBar().showMessage("部分导入别名发生冲突，已保留当前种类设置。", 7000)
+            for box in boxes:
+                try:
+                    self.label_catalog.add_label(box["label"])
+                except ValueError:
+                    pass  # Existing annotation text is never re-resolved as an alias.
+            self.canvas.set_annotations(boxes)
+            self.box_count_label.setText(f"标注框：{len(boxes)}")
+            self.annotation_save_label.setText("已载入标注" if boxes else "每次确认后自动保存到图片旁的 JSON 文件。")
+            self._refresh_catalog()
+        except (OSError, ValueError) as error:
+            self._annotation_load_error = True
+            self.canvas.set_annotations([])
+            self.canvas.setEnabled(False)
+            self.box_count_label.setText("标注加载失败")
+            self.annotation_save_label.setText("原标注文件已保留，请修复文件后重新打开图片。")
+            QMessageBox.warning(self, "无法读取标注", f"{error}\n\n为保护已有标注，当前图片暂时禁止编辑。")
 
     def _build_patch_viewer(self):
         container = QWidget()
@@ -661,11 +1008,7 @@ class MainWindow(QMainWindow):
             
             btn = QPushButton("...")
             btn.setFixedWidth(30)
-            if is_folder:
-                # Adjust _select_folder to work with QLabel
-                btn.clicked.connect(lambda: self._select_folder(label_widget))
-            else:
-                 pass 
+            # Each caller connects its own selector, once.
             input_layout.addWidget(btn)
             
             v_layout.addWidget(input_container)
@@ -799,6 +1142,8 @@ class MainWindow(QMainWindow):
         self.canvas.canvas_clicked.connect(self._on_canvas_clicked)
         
         layout.addWidget(self.canvas, 1) # Give it some stretch space
+        self._slice_canvas_layout = layout
+        self._slice_canvas_index = layout.indexOf(self.canvas)
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -908,6 +1253,8 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        if not self._prepare_image_change():
+            return
         
         # Normalize path separators
         path = os.path.normpath(path)
@@ -948,8 +1295,6 @@ class MainWindow(QMainWindow):
             else:
                 self._image_index = 0
 
-        self._load_current_image()
-        
         # Auto-set Normal/Abnormal paths if not set or user wants convenience
         normal_dir = os.path.join(folder, "Normal")
         abnormal_dir = os.path.join(folder, "Abnormal")
@@ -959,6 +1304,7 @@ class MainWindow(QMainWindow):
         
         self.normal_path_label.setText(normal_dir)
         self.abnormal_path_label.setText(abnormal_dir)
+        self._load_current_image()
 
     def _schedule_param_update(self):
         self._param_update_timer.start()
@@ -969,7 +1315,8 @@ class MainWindow(QMainWindow):
         self.canvas.set_patch_size(stride, stride)
         self.canvas.set_stride(stride)
         self._update_patch_count_label()
-        self._init_patch_review()
+        if self.mode_combo.currentIndex() == 1:
+            self._init_patch_review()
 
     def _update_patch_count_label(self):
         # Count Unit Modules
@@ -984,35 +1331,50 @@ class MainWindow(QMainWindow):
         if self._image_index < 0 or self._image_index >= len(self._image_list):
             return
         path = self._image_list[self._image_index]
+        # Decode before replacing the visible document so a bad file cannot leave
+        # the previous image paired with a new output filename.
+        try:
+            image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        except (OSError, cv2.error):
+            image = None
+        if image is None:
+            QMessageBox.warning(self, "无法打开图片", f"无法读取：{path}")
+            return
+        if not self.canvas.load_image(path):
+            QMessageBox.warning(self, "无法显示图片", f"无法显示：{path}")
+            return
         self._current_image_path = path
-        
+        self._current_image = image
         # Update current image label
         filename = os.path.basename(path)
         current_idx = self._image_index + 1
         total_count = len(self._image_list)
         self.current_image_label.setText(f"当前图片: {filename} ({current_idx}/{total_count})")
-        
-        self.canvas.load_image(path)
+        self.annotation_image_label.setText(filename)
+        self.annotation_image_label.setToolTip(path)
+        self.image_position_label.setText(f"{filename}  ·  {current_idx}/{total_count}")
         
         # Restore mask from ProjectManager
         mask = self.project_manager.get_mask(path)
         if mask is not None:
             self.canvas.set_mask(mask)
+        elif self.mode_combo.currentIndex() == 1:
+            self.canvas.ensure_slice_mask()
             
         self.source_path_label.setText(path)
         
-        # Fix for Chinese path reading in OpenCV (Windows)
-        try:
-            self._current_image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
-        except Exception as e:
-            print(f"Error reading image: {e}")
-            self._current_image = None
+        h, w = image.shape[:2]
+        self._load_annotations(path, w, h)
             
         # Update patch count immediately when image loaded
         self._update_patch_count_label()
         
-        # Initialize patch review
-        self._init_patch_review()
+        # Allocate grid traversal only when the slicing workflow is in use.
+        if self.mode_combo.currentIndex() == 1:
+            self._init_patch_review()
+        else:
+            self._patch_coords = []
+            self._current_patch_index = 0
         
         # Filter gallery to show only current image's patches
         self._filter_gallery_by_current_image()
@@ -1021,9 +1383,8 @@ class MainWindow(QMainWindow):
         if not self._image_list:
             return
         
-        # Save current mask
-        if self._current_image_path:
-            self.project_manager.set_mask(self._current_image_path, self.canvas.get_mask())
+        if not self._prepare_image_change():
+            return
             
         self._image_index = max(self._image_index - 1, 0)
         self._load_current_image()
@@ -1032,9 +1393,8 @@ class MainWindow(QMainWindow):
         if not self._image_list:
             return
         
-        # Save current mask
-        if self._current_image_path:
-            self.project_manager.set_mask(self._current_image_path, self.canvas.get_mask())
+        if not self._prepare_image_change():
+            return
             
         self._image_index = min(self._image_index + 1, len(self._image_list) - 1)
         self._load_current_image()
@@ -1046,7 +1406,9 @@ class MainWindow(QMainWindow):
             "stride": self.stride_spin.value(),
             "threshold": self.threshold_spin.value(),
             "normal_dir": self.normal_path_label.text(),
-            "abnormal_dir": self.abnormal_path_label.text()
+            "abnormal_dir": self.abnormal_path_label.text(),
+            "label_catalog": self.label_catalog.to_list(),
+            "mode": self.mode_combo.currentIndex(),
         }
 
     def _apply_config(self, config):
@@ -1062,15 +1424,29 @@ class MainWindow(QMainWindow):
         if "abnormal_dir" in config:
             self.abnormal_path_label.setText(config["abnormal_dir"])
             self.project_manager.abnormal_dir = config["abnormal_dir"]
+        if "label_catalog" in config:
+            self.label_catalog = LabelCatalog(config["label_catalog"])
+            self._refresh_catalog()
+        self.mode_combo.setCurrentIndex(config.get("mode", 0))
 
     def _on_new_project(self):
+        if not self._prepare_image_change():
+            return
         self.project_manager = ProjectManager()
         self._image_list = []
         self._image_index = -1
         self._current_image_path = None
         self._current_image = None
         self.canvas.reset_view()
-        self.source_path_edit.clear()
+        self.canvas.set_annotations([])
+        self.canvas.setEnabled(True)
+        self._boxes_dirty = False
+        self._annotation_load_error = False
+        self.annotation_image_label.setText("尚未打开图片")
+        self.box_count_label.setText("标注框：0")
+        self.annotation_save_label.setText("每次确认后自动保存到图片旁的 JSON 文件。")
+        self.image_position_label.setText("打开一张图片后，可继续浏览同文件夹中的图片")
+        self.source_path_label.setText("未选择")
         self.normal_list.clear()
         self.abnormal_list.clear()
         self.setWindowTitle("Industrial Image Slicer & Annotator - New Project")
@@ -1080,9 +1456,21 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "打开工程", "", "Project Files (*.json)")
         if not path:
             return
+        if not self._prepare_image_change():
+            return
         
         try:
             current_index, config, normal_files, abnormal_files = self.project_manager.load_project(path)
+            self._current_image_path = None
+            self._current_image = None
+            self._boxes_dirty = False
+            self._annotation_load_error = False
+            self.canvas.reset_view()
+            self.canvas.setEnabled(True)
+            self.annotation_image_label.setText("尚未打开图片")
+            self.box_count_label.setText("标注框：0")
+            self.annotation_save_label.setText("每次确认后自动保存到图片旁的 JSON 文件。")
+            self.image_position_label.setText("工程中没有可显示的图片")
             self._apply_config(config)
             
             self._image_list = self.project_manager.images
@@ -1125,6 +1513,8 @@ class MainWindow(QMainWindow):
         
     def _save_project_impl(self, path):
         from PySide6.QtWidgets import QMessageBox
+        if not self._prepare_image_change():
+            return
         # Ensure current mask is updated in project manager
         if self._current_image_path:
             self.project_manager.set_mask(self._current_image_path, self.canvas.get_mask())
@@ -1199,6 +1589,13 @@ class MainWindow(QMainWindow):
         self.canvas.set_smart_grid(self.smart_grid_checkbox.isChecked())
 
     def closeEvent(self, event):
+        if self._slicer_thread is not None and self._slicer_thread.isRunning():
+            self.statusBar().showMessage("正在保存切图，请完成后再关闭窗口。", 5000)
+            event.ignore()
+            return
+        if not self._prepare_image_change():
+            event.ignore()
+            return
         self._save_global_config()
         super().closeEvent(event)
 
@@ -1207,12 +1604,7 @@ class MainWindow(QMainWindow):
 
     def _save_global_config(self):
         config = {
-            "patch_width": self.patch_width_spin.value(),
-            "patch_height": self.patch_height_spin.value(),
-            "stride": self.stride_spin.value(),
-            "threshold": self.threshold_spin.value(),
-            "normal_dir": self.normal_path_label.text(),
-            "abnormal_dir": self.abnormal_path_label.text(),
+            **self._get_current_config(),
             "smart_grid": self.smart_grid_checkbox.isChecked(),
             "mask_opacity": self.mask_opacity_slider.value()
         }
@@ -1229,6 +1621,7 @@ class MainWindow(QMainWindow):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
+            self._apply_config({k: v for k, v in config.items() if k != "mode"})
             
             self.patch_width_spin.setValue(config.get("patch_width", 256))
             self.patch_height_spin.setValue(config.get("patch_height", 256))
@@ -1245,8 +1638,8 @@ class MainWindow(QMainWindow):
 
 
     def _on_slice_and_next(self):
-        self._auto_next = True
-        self._on_slice()
+        if self.mode_combo.currentIndex() == 1 and self._on_slice():
+            self._auto_next = True
 
     def _on_slice(self):
         if self._current_image is None or self._slicer_thread is not None:
@@ -1298,6 +1691,7 @@ class MainWindow(QMainWindow):
         self._slicer_thread.finished_signal.connect(self._on_slice_finished)
         self._slicer_thread.finished.connect(self._on_thread_finished)
         self._slicer_thread.start()
+        return True
 
     def _init_patch_review(self):
         self._patch_coords = []
@@ -1520,6 +1914,8 @@ def main():
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
+    if "--smoke-test" in sys.argv:
+        QTimer.singleShot(300, app.quit)
     sys.exit(app.exec())
 
 
