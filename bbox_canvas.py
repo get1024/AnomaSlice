@@ -4,38 +4,42 @@ from copy import deepcopy
 import math
 
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QKeySequence, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QKeySequence, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsItem,
     QGraphicsRectItem,
-    QGraphicsSimpleTextItem,
     QGraphicsView,
     QLineEdit,
 )
 
+from xml_annotations import label_color
 
-class _BoxLabel(QGraphicsSimpleTextItem):
-    """A readable, constant-screen-size label on either light or dark images."""
 
-    def __init__(self, text, color):
-        super().__init__(text)
-        self.setFont(QFont("Microsoft YaHei", 10))
-        self.setBrush(QColor("white"))
+class _BoxLabel(QGraphicsItem):
+    """A constant-screen-size caption outside the defect rectangle."""
+
+    def __init__(self, text, color, room_above):
+        super().__init__()
+        self._text = text
+        self._font = QFont("Microsoft YaHei UI", 9)
+        metrics = QFontMetricsF(self._font)
+        height = metrics.height() + 4
+        self.above = room_above >= height + 2
+        self._rect = QRectF(0, -height - 2 if self.above else 2, metrics.horizontalAdvance(text) + 10, height)
         self._color = color
         self.setFlag(QGraphicsItem.ItemIgnoresTransformations)
         self.setAcceptedMouseButtons(Qt.NoButton)
 
     def boundingRect(self):
-        return super().boundingRect().adjusted(-4, -2, 4, 2)
+        return self._rect
 
     def paint(self, painter, option, widget=None):
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(24, 28, 35, 225))
-        painter.drawRect(self.boundingRect())
-        painter.setPen(QPen(self._color, 2))
-        painter.drawLine(self.boundingRect().topLeft(), self.boundingRect().bottomLeft())
-        super().paint(painter, option, widget)
+        painter.fillRect(self._rect, QColor(24, 28, 35, 225))
+        painter.fillRect(QRectF(0, self._rect.y(), 2, self._rect.height()), self._color)
+        painter.setFont(self._font)
+        painter.setPen(Qt.white)
+        painter.drawText(self._rect.adjusted(5, 0, -2, 0), Qt.AlignLeft | Qt.AlignVCenter, self._text)
 
 
 class BoxCanvasMixin:
@@ -63,6 +67,7 @@ class BoxCanvasMixin:
         self._fit_scale = 1.0
         self.resolve_label = lambda text: text
         self.annotations_changed = lambda annotations: None
+        self.selection_changed = lambda index: None
         self.new_label_committed = lambda label: None
         super().__init__(*args, **kwargs)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -88,6 +93,16 @@ class BoxCanvasMixin:
         for item in self._annotation_items:
             item.setVisible(self._annotation_mode)
         self.viewport().setCursor(Qt.CrossCursor if self._annotation_mode else Qt.ArrowCursor)
+
+    @property
+    def selected_annotation(self):
+        return self._selected_annotation
+
+    def select_annotation(self, index):
+        selected = index if 0 <= index < len(self._annotations) else None
+        if self._selected_annotation != selected:
+            self._selected_annotation = selected
+            self._render_annotations()
 
     def get_annotations(self):
         return deepcopy(self._annotations)
@@ -427,7 +442,9 @@ class BoxCanvasMixin:
             self._scene.removeItem(item)
         self._annotation_items.clear()
         for index, annotation in enumerate(self._annotations):
-            color = QColor.fromHsv(sum(ord(char) * 37 for char in annotation["label"]) % 360, 180, 255)
+            color = QColor(annotation.get("color", ""))
+            if not color.isValid():
+                color = QColor(label_color(annotation["label"]))
             selected = index == self._selected_annotation
             item = QGraphicsRectItem(QRectF(*annotation["bbox"]))
             pen = QPen(QColor("#ffffff") if selected else color, 3 if selected else 2)
@@ -435,13 +452,15 @@ class BoxCanvasMixin:
             item.setPen(pen)
             item.setBrush(QColor(color.red(), color.green(), color.blue(), 25 if selected else 8))
             item.setAcceptedMouseButtons(Qt.NoButton)
-            item.setZValue(10)
+            item.setZValue(12 if selected else 10)
             item.setVisible(self._annotation_mode)
             self._scene.addItem(item)
-            label = _BoxLabel(annotation["label"], color)
+            caption = f'{index + 1} · {annotation["label"]}'
             rect = item.rect()
-            label.setPos(rect.x() + 1, rect.y() + 1)
-            label.setZValue(11)
+            label = _BoxLabel(caption, color, rect.top() * self._fit_scale)
+            label.setPos(rect.topLeft() if label.above else rect.bottomLeft())
+            label.setZValue(13 if selected else 11)
             label.setVisible(self._annotation_mode)
             self._scene.addItem(label)
             self._annotation_items.extend((item, label))
+        self.selection_changed(self._selected_annotation)

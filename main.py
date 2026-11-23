@@ -16,7 +16,7 @@ def main():
         def check_runtime():
             try:
                 from runtime_check import verify_runtime
-                verify_runtime()
+                verify_runtime(window)
             except Exception:
                 if sys.stderr is not None:
                     import traceback

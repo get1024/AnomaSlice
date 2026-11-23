@@ -2,16 +2,18 @@
 
 import os
 import tempfile
+from pathlib import Path
 
 from PySide6.QtGui import QColor, QImage, QPainter
 
-from annotation_store import AnnotationStore, LabelCatalog
+from annotation_store import LabelCatalog
 from app_window import CanvasWidget
 from project_store import ProjectManager
 from slicer import SlicerThread, count_mask_pixels
+from xml_annotations import AnnotationXml, scan_folder
 
 
-def verify_runtime():
+def verify_runtime(window):
     with tempfile.TemporaryDirectory(prefix="AnomaSlice-check-") as directory:
         image_path = os.path.join(directory, "测试图片.png")
         image = QImage(64, 32, QImage.Format_RGB32)
@@ -30,10 +32,23 @@ def verify_runtime():
         if catalog.resolve("1") != "划痕" or catalog.resolve("待定1") != "待定1":
             raise RuntimeError("Alias resolution failed")
         boxes = [{"label": "划痕", "bbox": [4, 5, 10, 12]}]
-        store = AnnotationStore()
-        store.save(image_path, 64, 32, boxes, catalog.to_list())
-        if store.load(image_path, 64, 32)["boxes"] != boxes:
-            raise RuntimeError("Annotation JSON roundtrip failed")
+        for suffix in ("bmp", "jpg", "tiff", "webp"):
+            target = os.path.join(directory, "codec-" + suffix + "." + suffix)
+            if not image.save(target) or QImage(target).size() != image.size():
+                raise RuntimeError(f"Frozen {suffix} codec failed")
+        entry = next(entry for entry in scan_folder(directory) if entry.image == Path(image_path))
+        AnnotationXml.open(entry).save(boxes)
+        reopened = AnnotationXml.open(entry)
+        if reopened.boxes[0]["label"] != "划痕" or reopened.boxes[0]["bbox"] != boxes[0]["bbox"]:
+            raise RuntimeError("Annotation XML roundtrip failed")
+        window._open_source(Path(directory), entry.target())
+        if window.canvas.get_annotations() != reopened.boxes:
+            raise RuntimeError("The annotation page did not restore the XML boxes")
+        window.canvas.select_annotation(0)
+        window.canvas.delete_selected_annotation()
+        window._on_save_current()
+        if AnnotationXml.open(entry).boxes:
+            raise RuntimeError("XML deletion was not saved")
         canvas = CanvasWidget()
         try:
             if not canvas.load_image(image_path, image=loaded):

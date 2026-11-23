@@ -3,9 +3,9 @@
 import os
 import shutil
 import json
-import re
+from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QRectF, QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QListWidget,
@@ -21,6 +21,7 @@ from image_canvas import ScalableImageLabel, SliceCanvas
 from label_dialog import LabelDialog
 from project_store import ProjectManager
 from slicer import SlicerThread
+from xml_annotations import AnnotationXml, image_extensions, scan_folder
 
 
 class CanvasWidget(BoxCanvasMixin, SliceCanvas):
@@ -41,6 +42,8 @@ class MainWindow(QMainWindow):
         self._current_image = None
         self._image_list = []
         self._image_index = -1
+        self._image_entries = {}
+        self._xml_document = None
         self._thumbnail_queue = { }
         self._thumbnail_timer = None
         self._slicer_thread = None
@@ -50,7 +53,9 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.canvas.resolve_label = self.label_catalog.resolve
         self.canvas.annotations_changed = self._on_annotations_changed
+        self.canvas.selection_changed = self._sync_review_selection
         self.canvas.new_label_committed = self._on_label_committed
+        self._clear_annotation_state()
         self._load_global_config()
         self._set_mode(0)
 
@@ -83,9 +88,11 @@ class MainWindow(QMainWindow):
         # Initialize Canvas early for signal connections
         self.canvas = CanvasWidget()
 
-        self.open_image_action = QAction("打开图片", self)
+        self.open_image_action = QAction("打开图片或 XML…", self)
         self.open_image_action.setShortcut("Ctrl+I")
         self.open_image_action.triggered.connect(self._open_image)
+        self.open_folder_action = QAction("打开图片文件夹…", self)
+        self.open_folder_action.triggered.connect(self._open_folder)
 
         self.slice_and_next_action = QAction("Slice and Next", self)
         self.slice_and_next_action.setShortcut("Return")
@@ -97,6 +104,7 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("文件")
         file_menu.addAction(self.open_image_action)
+        file_menu.addAction(self.open_folder_action)
         file_menu.addSeparator()
         file_menu.addAction(self.new_project_action)
         file_menu.addAction(self.open_project_action)
@@ -168,30 +176,48 @@ class MainWindow(QMainWindow):
         title = QLabel("人工框选标注")
         title.setStyleSheet("font-weight: bold; font-size: 18px;")
         layout.addWidget(title)
-        open_button = QPushButton("打开图片…  (Ctrl+I)")
+        open_button = QPushButton("打开图片或 XML…  (Ctrl+I)")
         open_button.clicked.connect(self._open_image)
         layout.addWidget(open_button)
+        open_folder = QPushButton("打开文件夹…")
+        open_folder.clicked.connect(self._open_folder)
+        layout.addWidget(open_folder)
         self.annotation_image_label = QLabel("尚未打开图片")
         self.annotation_image_label.setWordWrap(True)
         self.annotation_image_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.annotation_image_label)
-        classes = QPushButton("缺陷种类与别名…")
-        classes.clicked.connect(self._edit_labels)
-        layout.addWidget(classes)
+        self.review_image_picker = QComboBox()
+        self.review_image_picker.setAccessibleName("当前图片")
+        self.review_image_picker.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.review_image_picker.currentIndexChanged.connect(self._go_to_image)
+        layout.addWidget(self.review_image_picker)
+        self.classes_button = QPushButton("缺陷种类与别名…")
+        self.classes_button.clicked.connect(self._edit_labels)
+        layout.addWidget(self.classes_button)
         self.catalog_label = QLabel("可直接输入标签，也可先设置种类别名。")
         self.catalog_label.setWordWrap(True)
         layout.addWidget(self.catalog_label)
         self.box_count_label = QLabel("标注框：0")
         layout.addWidget(self.box_count_label)
-        self.annotation_save_label = QLabel("每次确认后自动保存到图片旁的 JSON 文件。")
+        self.review_box_list = QListWidget()
+        self.review_box_list.setAccessibleName("当前图片的缺陷框")
+        self.review_box_list.setMaximumHeight(180)
+        self.review_box_list.currentRowChanged.connect(self.canvas.select_annotation)
+        delete_from_list = QAction(self.review_box_list)
+        delete_from_list.setShortcut("Delete")
+        delete_from_list.setShortcutContext(Qt.WidgetShortcut)
+        delete_from_list.triggered.connect(self.canvas.delete_selected_annotation)
+        self.review_box_list.addAction(delete_from_list)
+        layout.addWidget(self.review_box_list)
+        self.annotation_save_label = QLabel()
         self.annotation_save_label.setWordWrap(True)
         layout.addWidget(self.annotation_save_label)
         fit = QPushButton("适应窗口")
         fit.clicked.connect(self.canvas.fit_image)
         layout.addWidget(fit)
-        delete = QPushButton("删除所选框  (Delete)")
-        delete.clicked.connect(self.canvas.delete_selected_annotation)
-        layout.addWidget(delete)
+        self.delete_box_button = QPushButton("删除所选框  (Delete)")
+        self.delete_box_button.clicked.connect(self.canvas.delete_selected_annotation)
+        layout.addWidget(self.delete_box_button)
         undo_row = QHBoxLayout()
         undo = QPushButton("撤回")
         undo.clicked.connect(self._undo_current)
@@ -200,10 +226,13 @@ class MainWindow(QMainWindow):
         undo_row.addWidget(undo)
         undo_row.addWidget(redo)
         layout.addLayout(undo_row)
+        self.save_xml_button = QPushButton("保存 XML  (Ctrl+S)")
+        self.save_xml_button.clicked.connect(self._on_save_current)
+        layout.addWidget(self.save_xml_button)
         layout.addStretch()
-        help_text = QLabel("滚轮：缩放图片\n左键拖动：画框\n右键拖动：移动图片\nEnter：确认标签　Esc：取消\n单击：选框　双击：改标签\nCtrl+Z：撤回\nCtrl+Shift+Z：重做")
-        help_text.setWordWrap(True)
-        layout.addWidget(help_text)
+        self.annotation_help = QLabel("左键拖动画框，Enter 确认标签。\n单击选框，双击改标签，Delete 删除。\n滚轮缩放，右键拖动平移。\nCtrl+Z 撤回，Ctrl+Shift+Z 重做。")
+        self.annotation_help.setWordWrap(True)
+        layout.addWidget(self.annotation_help)
         navigation = QHBoxLayout()
         previous = QPushButton("上一张")
         previous.clicked.connect(self._on_prev_image)
@@ -216,6 +245,10 @@ class MainWindow(QMainWindow):
 
     def _set_mode(self, index):
         annotation = index == 0
+        if not annotation and not self._settle_xml_changes():
+            with QSignalBlocker(self.mode_combo):
+                self.mode_combo.setCurrentIndex(0)
+            return
         self.canvas.cancel_pending_annotation()
         if annotation:
             self._annotation_canvas_layout.addWidget(self.canvas)
@@ -225,6 +258,7 @@ class MainWindow(QMainWindow):
         self.center_stack.setCurrentIndex(index)
         self.gallery.setVisible(not annotation)
         self.canvas.set_annotation_mode(annotation)
+        self.save_project_action.setText("保存 XML" if annotation else "保存工程")
         if not annotation:
             self.canvas.ensure_slice_mask()
         self.slice_and_next_action.setEnabled(not annotation)
@@ -256,7 +290,7 @@ class MainWindow(QMainWindow):
             if self.canvas.has_pending_annotation():
                 self.statusBar().showMessage("请按 Enter 确认标签，或按 Esc 取消当前框。", 5000)
                 return
-            self._flush_annotations(force=True)
+            self._save_xml()
         else:
             self._on_save_project()
 
@@ -274,9 +308,6 @@ class MainWindow(QMainWindow):
             self.label_catalog = dialog.catalog
             self._refresh_catalog()
             self._save_global_config()
-            if self._current_image_path and not self._annotation_load_error:
-                self._boxes_dirty = True
-                self._flush_annotations()
 
     def _on_label_committed(self, label):
         self.label_catalog.add_label(label)
@@ -284,95 +315,120 @@ class MainWindow(QMainWindow):
         self._save_global_config()
 
     def _on_annotations_changed(self, boxes):
-        if not self._current_image_path or self._annotation_load_error:
+        if self._xml_document is None:
             return
-        self.project_manager.annotations[self._current_image_path] = boxes
-        self.box_count_label.setText(f"标注框：{len(boxes)}")
-        self._boxes_dirty = True
-        self._flush_annotations()
+        self._boxes_dirty = boxes != self._xml_document.boxes
+        self._show_boxes(boxes)
+        self.annotation_save_label.setText("有未保存的 XML 修改。" if self._boxes_dirty else self._xml_status())
 
-    def _flush_annotations(self, force=False):
-        if not self._current_image_path or self._current_image is None:
+    def _xml_status(self):
+        doc = self._xml_document
+        if doc.exists:
+            return f"已载入 {doc.path.name}"
+        if doc.boxes:
+            return "已载入旧标注，保存后生成 XML。"
+        return f"保存后新建 {doc.path.name}"
+
+    def _save_xml(self):
+        doc = self._xml_document
+        if doc is None:
             return True
-        if self._annotation_load_error:
-            return True  # Keep unreadable sidecars untouched; navigation remains available.
-        if not self._boxes_dirty and not force:
-            return True
-        w, h = self._current_image.width(), self._current_image.height()
         try:
-            boxes = self.canvas.get_annotations()
-            saved_path = self.annotation_store.save(
-                self._current_image_path, w, h, boxes, self.label_catalog.to_list()
-            )
+            entry = self._image_entries[Path(self._current_image_path).resolve()]
+            if entry.target() != doc.path:
+                raise ValueError("图片的同名 XML 已变化，请重新打开图片。")
+            doc.save(self.canvas.get_annotations())
         except (OSError, ValueError) as error:
-            self.annotation_save_label.setText(f"保存失败：{error}")
-            self.statusBar().showMessage("标注尚未保存，请检查图片目录的写入权限后按 Ctrl+S 重试。")
+            self.annotation_save_label.setText(f"XML 保存失败：{error}")
+            QMessageBox.warning(self, "XML 尚未保存", str(error))
             return False
-        self.project_manager.annotations[self._current_image_path] = boxes
         self._boxes_dirty = False
-        self.annotation_save_label.setText("已自动保存 ✓")
-        self.annotation_save_label.setToolTip(str(saved_path))
-        self.statusBar().showMessage(f"已保存 {len(boxes)} 个标注框", 3000)
+        self.save_xml_button.setEnabled(False)
+        self.annotation_save_label.setText(f"XML 已保存，当前 {len(doc.boxes)} 个框。")
         return True
+
+    def _settle_xml_changes(self):
+        if not self._boxes_dirty:
+            return True
+        answer = QMessageBox.question(
+            self, "保存标注修改", f"将当前修改写入 {self._xml_document.path.name}？",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save,
+        )
+        if answer == QMessageBox.Save:
+            return self._save_xml()
+        if answer == QMessageBox.Discard:
+            self._boxes_dirty = False
+            self.canvas.set_annotations(self._xml_document.boxes)
+            self._show_boxes(self._xml_document.boxes)
+            self.annotation_save_label.setText(self._xml_status())
+            return True
+        return False
 
     def _prepare_image_change(self):
         if self._slicer_thread is not None and self._slicer_thread.isRunning():
             self.statusBar().showMessage("正在保存切图，请完成后再切换图片。", 5000)
             return False
         self.canvas.cancel_pending_annotation()
-        if not self._flush_annotations():
-            QMessageBox.warning(self, "标注尚未保存", "保存失败，当前图片已保留。请检查写入权限后按 Ctrl+S 重试。")
+        if not self._settle_xml_changes():
             return False
         if self._current_image_path:
             self.project_manager.set_mask(self._current_image_path, self.canvas.get_mask())
         return True
 
     def _load_annotations(self, path, width, height):
-        self._boxes_dirty = False
-        self._annotation_load_error = False
-        self.canvas.setEnabled(True)
+        self._clear_annotation_state()
         try:
-            document = self.annotation_store.load(path, width, height)
-            boxes = document["boxes"]
-            if not os.path.exists(path + ".annotations.json"):
-                boxes = self.project_manager.annotations.get(path, boxes)
-                boxes = self.annotation_store.validate_boxes(boxes, width, height)
-            # Merge portable labels, preserving existing bindings when aliases conflict.
-            for record in document.get("label_catalog", []):
-                records = self.label_catalog.to_list()
-                by_name = {r["name"]: r for r in records}
-                if record["name"] not in by_name:
-                    try:
-                        self.label_catalog.add_label(record["name"])
-                    except ValueError:
-                        self.statusBar().showMessage("导入类别与当前别名冲突，已有框的标签仍原样保留。", 7000)
-                        continue
-                for alias in record["aliases"]:
-                    records = self.label_catalog.to_list()
-                    target = next(r for r in records if r["name"] == record["name"])
-                    if alias in target["aliases"]:
-                        continue
-                    target["aliases"].append(alias)
-                    try:
-                        self.label_catalog = LabelCatalog(records)
-                    except ValueError:
-                        self.statusBar().showMessage("部分导入别名发生冲突，已保留当前种类设置。", 7000)
-            for box in boxes:
+            image_path = Path(path).resolve()
+            if image_path not in self._image_entries:
+                # Older projects store image paths only. Resolve their adjacent annotations on demand.
+                entries = scan_folder(image_path.parent, recursive=False)
+                self._image_entries.update((entry.image, entry) for entry in entries)
+            entry = self._image_entries.get(image_path)
+            if entry is None:
+                raise ValueError("图片已移动，请重新打开文件夹。")
+            doc = AnnotationXml.open(entry)
+            if not doc.exists:
+                legacy = self.annotation_store.load(path, width, height)
+                if os.path.isfile(self.annotation_store.sidecar_path(path)):
+                    doc.boxes = legacy["boxes"]
+                else:
+                    doc.boxes = self.annotation_store.validate_boxes(
+                        self.project_manager.annotations.get(path, []), width, height
+                    )
+                self._merge_legacy_labels(legacy.get("label_catalog", []))
+            for box in doc.boxes:
                 try:
                     self.label_catalog.add_label(box["label"])
                 except ValueError:
-                    pass  # Existing annotation text is never re-resolved as an alias.
-            self.canvas.set_annotations(boxes)
-            self.box_count_label.setText(f"标注框：{len(boxes)}")
-            self.annotation_save_label.setText("已载入标注" if boxes else "每次确认后自动保存到图片旁的 JSON 文件。")
+                    pass  # Preserve existing label text even when it is now an alias.
+            self._xml_document = doc
+            self.canvas.set_annotations(doc.boxes)
+            self._show_boxes(doc.boxes)
+            self.annotation_save_label.setText(self._xml_status())
+            self.annotation_save_label.setToolTip(str(doc.path))
             self._refresh_catalog()
         except (OSError, ValueError) as error:
             self._annotation_load_error = True
-            self.canvas.set_annotations([])
             self.canvas.setEnabled(False)
-            self.box_count_label.setText("标注加载失败")
-            self.annotation_save_label.setText("原标注文件已保留，请修复文件后重新打开图片。")
-            QMessageBox.warning(self, "无法读取标注", f"{error}\n\n为保护已有标注，当前图片暂时禁止编辑。")
+            self.annotation_save_label.setText(f"无法编辑标注：{error}")
+            self.annotation_save_label.setToolTip(str(error))
+
+    def _merge_legacy_labels(self, records):
+        for record in records:
+            try:
+                self.label_catalog.add_label(record["name"])
+            except ValueError:
+                self.statusBar().showMessage("旧标注中的类别与现有别名冲突，已保留现有设置。", 7000)
+                continue
+            for alias in record["aliases"]:
+                merged = self.label_catalog.to_list()
+                target = next(r for r in merged if r["name"] == record["name"])
+                if alias not in target["aliases"]:
+                    target["aliases"].append(alias)
+                    try:
+                        self.label_catalog = LabelCatalog(merged)
+                    except ValueError:
+                        self.statusBar().showMessage("旧标注中的别名冲突，已保留现有设置。", 7000)
 
     def _build_patch_viewer(self):
         container = QWidget()
@@ -697,56 +753,92 @@ class MainWindow(QMainWindow):
             label_widget.setText(norm_path)
             self.project_manager.abnormal_dir = norm_path
 
+    def _clear_annotation_state(self):
+        self._xml_document = None
+        self._boxes_dirty = False
+        self._annotation_load_error = False
+        self.canvas.setEnabled(True)
+        self.canvas.set_annotations([])
+        self._show_boxes([])
+        self.annotation_save_label.setText("打开图片或文件夹开始标注。")
+        self.annotation_save_label.setToolTip("")
+
+    def _sync_review_selection(self, index):
+        with QSignalBlocker(self.review_box_list):
+            self.review_box_list.setCurrentRow(-1 if index is None else index)
+        self.delete_box_button.setEnabled(index is not None)
+
+    def _show_boxes(self, boxes):
+        with QSignalBlocker(self.review_box_list):
+            self.review_box_list.clear()
+            for number, box in enumerate(boxes, 1):
+                caption = f'{number} · {box["label"]}'
+                if box.get("confidence"):
+                    caption += f'    {box["confidence"]}'
+                item = QListWidgetItem(caption)
+                x, y, w, h = box["bbox"]
+                item.setToolTip(f"左上角 ({x:g}, {y:g})　宽 {w:g}　高 {h:g}")
+                self.review_box_list.addItem(item)
+        self._sync_review_selection(self.canvas.selected_annotation)
+        self.box_count_label.setText(f"标注框：{len(boxes)}")
+        doc = self._xml_document
+        self.save_xml_button.setEnabled(doc is not None and (self._boxes_dirty or not doc.exists))
+
+    def _open_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择图片文件夹（含子目录）")
+        if folder:
+            self._open_source(Path(folder).resolve())
+
     def _open_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择图片",
-            "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)",
-        )
-        if not path:
+        patterns = " ".join(f"*.{ext}" for ext in sorted(image_extensions()))
+        path, _ = QFileDialog.getOpenFileName(self, "选择图片或缺陷 XML", "", f"图片和标注 ({patterns} *.xml);;所有文件 (*)")
+        if path:
+            selected = Path(path).resolve()
+            root = selected.parent
+            if selected.suffix.lower() == ".xml" and root.name.casefold() == "xml":
+                root = root.parent
+            self._open_source(root, selected)
+
+    def _populate_image_picker(self, root=None):
+        with QSignalBlocker(self.review_image_picker):
+            self.review_image_picker.clear()
+            for path in self._image_list:
+                name = str(Path(path).relative_to(root)) if root else path
+                self.review_image_picker.addItem(name)
+            self.review_image_picker.setCurrentIndex(self._image_index)
+
+    def _open_source(self, folder, selected=None):
+        selected_xml = selected is not None and selected.suffix.lower() == ".xml"
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            entries = scan_folder(folder, recursive=selected is None or selected_xml)
+        except OSError as error:
+            QMessageBox.warning(self, "无法扫描文件夹", str(error))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        if selected_xml:
+            matches = [entry for entry in entries if entry.xml == selected]
+            if len(matches) != 1:
+                QMessageBox.warning(self, "无法匹配图片", "未找到唯一对应的图片。请打开包含图片和 XML 的上级文件夹。")
+                return
+            selected = matches[0].image
+        paths = [entry.image for entry in entries]
+        if not paths or (selected is not None and selected not in paths):
+            QMessageBox.information(self, "没有可显示的图片", "所选位置没有可识别的图片。")
             return
         if not self._prepare_image_change():
             return
-
-        # Normalize path separators
-        path = os.path.normpath(path)
-        folder = os.path.dirname(path)
-        filename = os.path.basename(path)
-
-        # Update source path label
-        self.source_path_label.setText(folder)
-
-        # Natural sort for images
-        def natural_key(text):
-            return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', text)]
-
-        files = [
-            name for name in os.listdir(folder)
-            if name.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"))
-        ]
-        files.sort(key=natural_key)
-
-        self._image_list = [
-            os.path.normpath(os.path.join(folder, name))
-            for name in files
-        ]
-
-        # Update Project Manager
+        if selected_xml or selected is None:
+            self.mode_combo.setCurrentIndex(0)
+        self._image_entries = {entry.image: entry for entry in entries}
+        self._image_list = [str(path) for path in paths]
+        self._image_index = paths.index(selected) if selected is not None else 0
+        self._populate_image_picker(folder)
         self.project_manager.set_images(self._image_list)
         self.project_manager.project_path = None
-
-        try:
-            self._image_index = self._image_list.index(path)
-        except ValueError:
-            # Fallback: try to find by basename if full path match fails
-            target_base = os.path.basename(path)
-            for i, p in enumerate(self._image_list):
-                if os.path.basename(p) == target_base:
-                    self._image_index = i
-                    break
-            else:
-                self._image_index = 0
+        self.annotation_image_label.setText(f"{folder.name}  ·  {len(paths)} 张图片")
+        self.annotation_image_label.setToolTip(str(folder))
 
         # Auto-set Normal/Abnormal paths if not set or user wants convenience
         normal_dir = os.path.join(folder, "Normal")
@@ -784,25 +876,30 @@ class MainWindow(QMainWindow):
         if self._image_index < 0 or self._image_index >= len(self._image_list):
             return
         path = self._image_list[self._image_index]
-        # Decode before replacing the visible document so a bad file cannot leave
-        # the previous image paired with a new output filename.
-        image = QImage(path)
-        if image.isNull():
-            QMessageBox.warning(self, "无法打开图片", f"无法读取：{path}")
-            return
-        if not self.canvas.load_image(path, image=image):
-            QMessageBox.warning(self, "无法显示图片", f"无法显示：{path}")
-            return
-        self._current_image_path = path
-        self._current_image = image
-        # Update current image label
         filename = os.path.basename(path)
         current_idx = self._image_index + 1
         total_count = len(self._image_list)
         self.current_image_label.setText(f"当前图片: {filename} ({current_idx}/{total_count})")
-        self.annotation_image_label.setText(filename)
-        self.annotation_image_label.setToolTip(path)
+        with QSignalBlocker(self.review_image_picker):
+            self.review_image_picker.setCurrentIndex(self._image_index)
+        self.review_image_picker.setToolTip(path)
         self.image_position_label.setText(f"{filename}  ·  {current_idx}/{total_count}")
+        self.source_path_label.setText(path)
+        image = QImage(path)
+        if image.isNull() or not self.canvas.load_image(path, image=image):
+            self._current_image_path = None
+            self._current_image = None
+            self.canvas.reset_view()
+            self._clear_annotation_state()
+            self.annotation_save_label.setText("图片读取失败，可继续浏览其他图片。")
+            self.annotation_save_label.setToolTip(path)
+            self._patch_coords = []
+            self._current_patch_index = 0
+            self._update_patch_view()
+            QMessageBox.warning(self, "无法显示图片", f"无法读取：{path}")
+            return
+        self._current_image_path = path
+        self._current_image = image
 
         # Restore mask from ProjectManager
         mask = self.project_manager.get_mask(path)
@@ -811,10 +908,7 @@ class MainWindow(QMainWindow):
         elif self.mode_combo.currentIndex() == 1:
             self.canvas.ensure_slice_mask()
 
-        self.source_path_label.setText(path)
-
-        w, h = image.width(), image.height()
-        self._load_annotations(path, w, h)
+        self._load_annotations(path, image.width(), image.height())
 
         # Update patch count immediately when image loaded
         self._update_patch_count_label()
@@ -830,23 +924,19 @@ class MainWindow(QMainWindow):
         self._filter_gallery_by_current_image()
 
     def _on_prev_image(self):
-        if not self._image_list:
-            return
-
-        if not self._prepare_image_change():
-            return
-
-        self._image_index = max(self._image_index - 1, 0)
-        self._load_current_image()
+        self._go_to_image(self._image_index - 1)
 
     def _on_next_image(self):
-        if not self._image_list:
-            return
+        self._go_to_image(self._image_index + 1)
 
+    def _go_to_image(self, index):
+        if not 0 <= index < len(self._image_list) or self._image_index == index:
+            return
         if not self._prepare_image_change():
+            with QSignalBlocker(self.review_image_picker):
+                self.review_image_picker.setCurrentIndex(self._image_index)
             return
-
-        self._image_index = min(self._image_index + 1, len(self._image_list) - 1)
+        self._image_index = index
         self._load_current_image()
 
     def _get_current_config(self):
@@ -882,19 +972,16 @@ class MainWindow(QMainWindow):
     def _on_new_project(self):
         if not self._prepare_image_change():
             return
+        self._image_entries = {}
         self.project_manager = ProjectManager()
         self._image_list = []
         self._image_index = -1
         self._current_image_path = None
         self._current_image = None
         self.canvas.reset_view()
-        self.canvas.set_annotations([])
-        self.canvas.setEnabled(True)
-        self._boxes_dirty = False
-        self._annotation_load_error = False
+        self._clear_annotation_state()
+        self._populate_image_picker()
         self.annotation_image_label.setText("尚未打开图片")
-        self.box_count_label.setText("标注框：0")
-        self.annotation_save_label.setText("每次确认后自动保存到图片旁的 JSON 文件。")
         self.image_position_label.setText("打开一张图片后，可继续浏览同文件夹中的图片")
         self.source_path_label.setText("未选择")
         self.normal_list.clear()
@@ -911,20 +998,19 @@ class MainWindow(QMainWindow):
 
         try:
             current_index, config, normal_files, abnormal_files = self.project_manager.load_project(path)
+            self._image_entries = {}
             self._current_image_path = None
             self._current_image = None
-            self._boxes_dirty = False
-            self._annotation_load_error = False
             self.canvas.reset_view()
-            self.canvas.setEnabled(True)
-            self.annotation_image_label.setText("尚未打开图片")
-            self.box_count_label.setText("标注框：0")
-            self.annotation_save_label.setText("每次确认后自动保存到图片旁的 JSON 文件。")
+            self._clear_annotation_state()
+            self.annotation_image_label.setText(os.path.basename(path))
+            self.annotation_image_label.setToolTip(path)
             self.image_position_label.setText("工程中没有可显示的图片")
             self._apply_config(config)
 
             self._image_list = self.project_manager.images
             self._image_index = current_index
+            self._populate_image_picker()
 
             # Restore Gallery
             self.normal_list.clear()

@@ -54,8 +54,8 @@ analysis = Analysis(
 # ICU instead; that DLL has version-suffixed exports and breaks QtCore import.
 # Leave ICU to Windows, as the original, unfrozen PySide6 process does.
 # QFileDialog and QGraphicsView use native/raster widgets. They need neither
-# OpenGL's software fallback nor network, SVG/PDF, TLS or SQL plugins. BMP/PNG
-# are built into Qt; retain the still-image codecs used by the image picker.
+# OpenGL's software fallback nor network, PDF, TLS or SQL plugins. Keep Qt's
+# installed image codecs so folder discovery matches what the EXE can decode.
 def keep_binary(entry):
     destination = Path(entry[0])
     filename = destination.name.lower()
@@ -68,7 +68,7 @@ def keep_binary(entry):
         if "platforms" in parts:
             return filename in {"qwindows.dll", "qoffscreen.dll"}
         if "imageformats" in parts:
-            return filename in {"qjpeg.dll", "qgif.dll", "qico.dll", "qtiff.dll"}
+            return filename != "qpdf.dll"
         return False
     return True
 
