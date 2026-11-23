@@ -1,4 +1,4 @@
-## v1.3.0 — 在「框选标注」中审核和续编缺陷 XML
+## v1.3.1 — 在「框选标注」中审核和续编缺陷 XML
 
 下载下方 Assets 中的 **AnomaSlice.exe**，在 Windows x64 上双击即可运行，无需安装 Python。
 

@@ -27,7 +27,7 @@ class AppWorkflowTests(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.config_patch = patch.object(MainWindow, "_get_global_config_path", return_value=str(self.root / "settings.json"))
         self.config_patch.start()
         self.messages = [patch("app_window.QMessageBox.warning"), patch("app_window.QMessageBox.information"), patch("app_window.QMessageBox.critical"),

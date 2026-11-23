@@ -14,7 +14,8 @@ from xml_annotations import AnnotationXml, scan_folder
 
 
 def verify_runtime(window):
-    with tempfile.TemporaryDirectory(prefix="AnomaSlice-check-") as directory:
+    with tempfile.TemporaryDirectory(prefix="AnomaSlice-check-") as temp_path:
+        directory = Path(temp_path).resolve()
         image_path = os.path.join(directory, "测试图片.png")
         image = QImage(64, 32, QImage.Format_RGB32)
         image.fill(QColor(120, 140, 160))
@@ -41,7 +42,7 @@ def verify_runtime(window):
         reopened = AnnotationXml.open(entry)
         if reopened.boxes[0]["label"] != "划痕" or reopened.boxes[0]["bbox"] != boxes[0]["bbox"]:
             raise RuntimeError("Annotation XML roundtrip failed")
-        window._open_source(Path(directory), entry.target())
+        window._open_source(directory, entry.target())
         if window.canvas.get_annotations() != reopened.boxes:
             raise RuntimeError("The annotation page did not restore the XML boxes")
         window.canvas.select_annotation(0)
