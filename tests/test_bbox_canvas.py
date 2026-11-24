@@ -115,6 +115,48 @@ class BoxCanvasTests(unittest.TestCase):
         self.canvas.annotation_undo()
         self.assertEqual(len(self.canvas.get_annotations()), 1)
 
+    def test_prediction_overlay_is_visible_but_only_gt_can_be_edited(self):
+        gt = [{"label": "GT", "bbox": [100, 100, 100, 80]}]
+        predictions = [
+            {"label": "overlap", "bbox": [100, 100, 100, 80]},
+            {"label": "prediction only", "bbox": [300, 120, 60, 40]},
+        ]
+        self.canvas.set_annotations(gt)
+        self.canvas.set_predictions(predictions)
+        outline, caption = self.canvas._prediction_items[:2]
+        gt_outline, gt_caption = self.canvas._annotation_items
+        self.assertEqual(outline.rect(), gt_outline.rect())
+        self.assertGreater(outline.zValue(), gt_outline.zValue())
+        self.assertEqual(outline.pen().style(), Qt.DashLine)
+        self.assertEqual(gt_outline.pen().style(), Qt.SolidLine)
+        self.assertNotEqual(caption.pos(), gt_caption.pos())
+        self.assertTrue(all(item.isVisible() for item in self.canvas._prediction_items))
+
+        prediction_only = self.canvas.mapFromScene(QPointF(320, 130))
+        QTest.mouseClick(self.canvas.viewport(), Qt.LeftButton, Qt.NoModifier, prediction_only)
+        self.assertIsNone(self.canvas.selected_annotation)
+        QTest.mouseDClick(self.canvas.viewport(), Qt.LeftButton, Qt.NoModifier, prediction_only)
+        self.assertFalse(self.canvas.has_pending_annotation())
+        QTest.keyClick(self.canvas, Qt.Key_Delete)
+        self.assertEqual(self.changes, [])
+
+        overlap = self.canvas.mapFromScene(QPointF(120, 130))
+        QTest.mouseClick(self.canvas.viewport(), Qt.LeftButton, Qt.NoModifier, overlap)
+        QTest.keyClick(self.canvas, Qt.Key_Delete)
+        self.canvas.annotation_undo()
+        self.canvas.annotation_redo()
+        self.assertEqual(self.changes, [[], gt, []])
+        self.assertEqual(len(self.canvas._prediction_items), 4)
+        self.assertIs(outline.scene(), self.canvas.scene())
+
+        self.canvas.set_annotation_mode(False)
+        self.assertFalse(outline.isVisible())
+        self.canvas.set_annotation_mode(True)
+        self.assertTrue(outline.isVisible())
+        self.assertTrue(self.canvas.load_image(self.image_path))
+        self.assertEqual(self.canvas._prediction_items, [])
+        self.assertIsNone(outline.scene())
+
     def test_undo_redo_and_rename_preserve_mask(self):
         original_mask = self.canvas.get_mask()
         self.drag((100, 100), (200, 200))
@@ -133,6 +175,17 @@ class BoxCanvasTests(unittest.TestCase):
             self.assertIsNone(self.canvas.get_mask())
         else:
             self.assertEqual(original_mask, self.canvas.get_mask())
+
+    def test_captions_for_tiny_matching_boxes_stay_separate(self):
+        for y in (0, 100, 397):
+            with self.subTest(y=y):
+                boxes = [{"label": "scratch", "bbox": [60, y, 3, 3]}]
+                self.canvas.set_annotations(boxes)
+                self.canvas.set_predictions(boxes)
+                captions = (self.canvas._annotation_items[1], self.canvas._prediction_items[1])
+                bounds = [item.deviceTransform(self.canvas.viewportTransform()).mapRect(item.boundingRect())
+                          for item in captions]
+                self.assertFalse(bounds[0].intersects(bounds[1]))
 
     def test_pending_boxes_are_cancelled_without_committing(self):
         self.drag((10, 10), (100, 100))

@@ -17,16 +17,29 @@ from xml_annotations import label_color
 
 
 class _BoxLabel(QGraphicsItem):
-    """A constant-screen-size caption outside the defect rectangle."""
+    """A constant-screen-size caption anchored to a defect rectangle."""
 
-    def __init__(self, text, color, room_above):
+    def __init__(self, text, color, box, fit_scale, image_height, prediction):
         super().__init__()
         self._text = text
         self._font = QFont("Microsoft YaHei UI", 9)
         metrics = QFontMetricsF(self._font)
         height = metrics.height() + 4
-        self.above = room_above >= height + 2
-        self._rect = QRectF(0, -height - 2 if self.above else 2, metrics.horizontalAdvance(text) + 10, height)
+        row = height + 2
+        above = box.top() * fit_scale >= row
+        below = (image_height - box.bottom()) * fit_scale >= row
+        if above and below:
+            anchor = box.bottomLeft() if prediction else box.topLeft()
+            offset = 2 if prediction else -row
+        elif above:
+            anchor = box.topLeft()
+            offset = -2 * row if prediction else -row
+        else:
+            # Stack the captions on the same side when the box touches an image edge.
+            anchor = box.bottomLeft() if below else box.topLeft()
+            offset = 2 + row if prediction else 2
+        self.setPos(anchor)
+        self._rect = QRectF(0, offset, metrics.horizontalAdvance(text) + 10, height)
         self._color = color
         self.setFlag(QGraphicsItem.ItemIgnoresTransformations)
         self.setAcceptedMouseButtons(Qt.NoButton)
@@ -54,6 +67,7 @@ class BoxCanvasMixin:
         self._annotation_mode = False
         self._annotations = []
         self._annotation_items = []
+        self._prediction_items = []
         self._annotation_undo_stack = []
         self._annotation_redo_stack = []
         self._selected_annotation = None
@@ -90,7 +104,7 @@ class BoxCanvasMixin:
         self._annotation_mode = bool(enabled)
         self._grid_item.setVisible(not self._annotation_mode)
         self._mask_item.setVisible(not self._annotation_mode)
-        for item in self._annotation_items:
+        for item in self._annotation_items + self._prediction_items:
             item.setVisible(self._annotation_mode)
         self.viewport().setCursor(Qt.CrossCursor if self._annotation_mode else Qt.ArrowCursor)
 
@@ -114,6 +128,20 @@ class BoxCanvasMixin:
         self._annotation_undo_stack.clear()
         self._annotation_redo_stack.clear()
         self._render_annotations()
+
+    def set_predictions(self, annotations):
+        """Replace the display-only overlay independently of GT edits and history."""
+        for item in self._prediction_items:
+            self._scene.removeItem(item)
+        self._prediction_items.clear()
+        color = QColor("#00d5e8")
+        pen = QPen(color, 2, Qt.DashLine)
+        for index, annotation in enumerate(annotations or []):
+            caption = f'预测 {index + 1} · {annotation["label"]}'
+            items = self._add_box_items(
+                annotation, pen, Qt.NoBrush, caption, color, 14, prediction=True
+            )
+            self._prediction_items.extend(items)
 
     def has_pending_annotation(self):
         return self._pending_rect is not None or self._rename_index is not None
@@ -166,6 +194,7 @@ class BoxCanvasMixin:
         self.cancel_pending_annotation()
         self._user_view_adjusted = False
         self.set_annotations([])
+        self.set_predictions([])
         result = super().load_image(path, image=image)
         if result:
             self.fit_image()
@@ -173,6 +202,7 @@ class BoxCanvasMixin:
 
     def reset_view(self):
         self.set_annotations([])
+        self.set_predictions([])
         self._user_view_adjusted = False
         super().reset_view()
 
@@ -446,21 +476,24 @@ class BoxCanvasMixin:
             if not color.isValid():
                 color = QColor(label_color(annotation["label"]))
             selected = index == self._selected_annotation
-            item = QGraphicsRectItem(QRectF(*annotation["bbox"]))
             pen = QPen(QColor("#ffffff") if selected else color, 3 if selected else 2)
-            pen.setCosmetic(True)
-            item.setPen(pen)
-            item.setBrush(QColor(color.red(), color.green(), color.blue(), 25 if selected else 8))
-            item.setAcceptedMouseButtons(Qt.NoButton)
-            item.setZValue(12 if selected else 10)
-            item.setVisible(self._annotation_mode)
-            self._scene.addItem(item)
+            brush = QColor(color.red(), color.green(), color.blue(), 25 if selected else 8)
             caption = f'{index + 1} · {annotation["label"]}'
-            rect = item.rect()
-            label = _BoxLabel(caption, color, rect.top() * self._fit_scale)
-            label.setPos(rect.topLeft() if label.above else rect.bottomLeft())
-            label.setZValue(13 if selected else 11)
-            label.setVisible(self._annotation_mode)
-            self._scene.addItem(label)
-            self._annotation_items.extend((item, label))
+            items = self._add_box_items(annotation, pen, brush, caption, color, 12 if selected else 10)
+            self._annotation_items.extend(items)
         self.selection_changed(self._selected_annotation)
+
+    def _add_box_items(self, annotation, pen, brush, caption, color, z, prediction=False):
+        rect = QRectF(*annotation["bbox"])
+        item = QGraphicsRectItem(rect)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        item.setBrush(brush)
+        item.setAcceptedMouseButtons(Qt.NoButton)
+        item.setZValue(z)
+        label = _BoxLabel(caption, color, rect, self._fit_scale, self._image_rect().height(), prediction)
+        label.setZValue(z + 1)
+        for graphic in (item, label):
+            graphic.setVisible(self._annotation_mode)
+            self._scene.addItem(graphic)
+        return item, label

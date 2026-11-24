@@ -159,11 +159,14 @@ class AnnotationXml:
 
     @classmethod
     def open(cls, entry):
-        path = entry.target()
+        return cls.open_path(entry.target(), must_exist=entry.xml is not None)
+
+    @classmethod
+    def open_path(cls, path, *, must_exist=False):
         try:
             source = path.read_bytes()
         except FileNotFoundError:
-            if entry.xml is not None:
+            if must_exist:
                 raise
             source = None
         return cls(path, source)

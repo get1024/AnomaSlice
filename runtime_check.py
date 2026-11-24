@@ -50,6 +50,18 @@ def verify_runtime(window):
         window._on_save_current()
         if AnnotationXml.open(entry).boxes:
             raise RuntimeError("XML deletion was not saved")
+        predictions = directory / "predictions"
+        predictions.mkdir()
+        model_path = predictions / entry.target().name
+        AnnotationXml.open_path(model_path).save(boxes)
+        model_bytes = model_path.read_bytes()
+        window._open_source(directory, entry.image, comparison_sources=(None, predictions))
+        if not window.canvas._prediction_items or window.canvas.get_annotations():
+            raise RuntimeError("Frozen application did not separate GT and prediction boxes")
+        window.canvas.set_annotations(boxes)
+        window._on_save_current()
+        if not AnnotationXml.open(entry).boxes or model_path.read_bytes() != model_bytes:
+            raise RuntimeError("Comparison edits did not save exclusively to GT")
         canvas = CanvasWidget()
         try:
             if not canvas.load_image(image_path, image=loaded):

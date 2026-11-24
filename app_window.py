@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
 
 from annotation_store import AnnotationStore, LabelCatalog
 from bbox_canvas import BoxCanvasMixin
+from comparison_dialog import ComparisonDialog
+from comparison_paths import ComparisonSources, same_xml_path
 from image_canvas import ScalableImageLabel, SliceCanvas
 from label_dialog import LabelDialog
 from project_store import ProjectManager
@@ -44,6 +46,7 @@ class MainWindow(QMainWindow):
         self._image_index = -1
         self._image_entries = {}
         self._xml_document = None
+        self._comparison = None
         self._thumbnail_queue = { }
         self._thumbnail_timer = None
         self._slicer_thread = None
@@ -93,6 +96,8 @@ class MainWindow(QMainWindow):
         self.open_image_action.triggered.connect(self._open_image)
         self.open_folder_action = QAction("打开图片文件夹…", self)
         self.open_folder_action.triggered.connect(self._open_folder)
+        self.compare_xml_action = QAction("打开双 XML 对照…", self)
+        self.compare_xml_action.triggered.connect(self._open_comparison)
 
         self.slice_and_next_action = QAction("Slice and Next", self)
         self.slice_and_next_action.setShortcut("Return")
@@ -105,6 +110,7 @@ class MainWindow(QMainWindow):
         file_menu = menubar.addMenu("文件")
         file_menu.addAction(self.open_image_action)
         file_menu.addAction(self.open_folder_action)
+        file_menu.addAction(self.compare_xml_action)
         file_menu.addSeparator()
         file_menu.addAction(self.new_project_action)
         file_menu.addAction(self.open_project_action)
@@ -182,6 +188,9 @@ class MainWindow(QMainWindow):
         open_folder = QPushButton("打开文件夹…")
         open_folder.clicked.connect(self._open_folder)
         layout.addWidget(open_folder)
+        compare = QPushButton("打开双 XML 对照…")
+        compare.clicked.connect(self._open_comparison)
+        layout.addWidget(compare)
         self.annotation_image_label = QLabel("尚未打开图片")
         self.annotation_image_label.setWordWrap(True)
         self.annotation_image_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -209,6 +218,10 @@ class MainWindow(QMainWindow):
         delete_from_list.triggered.connect(self.canvas.delete_selected_annotation)
         self.review_box_list.addAction(delete_from_list)
         layout.addWidget(self.review_box_list)
+        self.prediction_status = QLabel()
+        self.prediction_status.setTextFormat(Qt.PlainText)
+        self.prediction_status.setWordWrap(True)
+        layout.addWidget(self.prediction_status)
         self.annotation_save_label = QLabel()
         self.annotation_save_label.setWordWrap(True)
         layout.addWidget(self.annotation_save_label)
@@ -226,7 +239,7 @@ class MainWindow(QMainWindow):
         undo_row.addWidget(undo)
         undo_row.addWidget(redo)
         layout.addLayout(undo_row)
-        self.save_xml_button = QPushButton("保存 XML  (Ctrl+S)")
+        self.save_xml_button = QPushButton("保存 GT XML  (Ctrl+S)")
         self.save_xml_button.clicked.connect(self._on_save_current)
         layout.addWidget(self.save_xml_button)
         layout.addStretch()
@@ -258,7 +271,7 @@ class MainWindow(QMainWindow):
         self.center_stack.setCurrentIndex(index)
         self.gallery.setVisible(not annotation)
         self.canvas.set_annotation_mode(annotation)
-        self.save_project_action.setText("保存 XML" if annotation else "保存工程")
+        self.save_project_action.setText("保存 GT XML" if annotation else "保存工程")
         if not annotation:
             self.canvas.ensure_slice_mask()
         self.slice_and_next_action.setEnabled(not annotation)
@@ -324,18 +337,20 @@ class MainWindow(QMainWindow):
     def _xml_status(self):
         doc = self._xml_document
         if doc.exists:
-            return f"已载入 {doc.path.name}"
+            return f"GT · {doc.path.name}"
         if doc.boxes:
             return "已载入旧标注，保存后生成 XML。"
-        return f"保存后新建 {doc.path.name}"
+        return f"保存后新建 GT · {doc.path.name}"
 
     def _save_xml(self):
         doc = self._xml_document
         if doc is None:
             return True
         try:
-            entry = self._image_entries[Path(self._current_image_path).resolve()]
-            if entry.target() != doc.path:
+            image = Path(self._current_image_path).resolve()
+            target = (self._comparison.resolve(image).gt if self._comparison
+                      else self._image_entries[image].target())
+            if target != doc.path:
                 raise ValueError("图片的同名 XML 已变化，请重新打开图片。")
             doc.save(self.canvas.get_annotations())
         except (OSError, ValueError) as error:
@@ -344,16 +359,23 @@ class MainWindow(QMainWindow):
             return False
         self._boxes_dirty = False
         self.save_xml_button.setEnabled(False)
-        self.annotation_save_label.setText(f"XML 已保存，当前 {len(doc.boxes)} 个框。")
+        self.annotation_save_label.setText(f"GT 已保存，当前 {len(doc.boxes)} 个框。")
         return True
 
-    def _settle_xml_changes(self):
+    def _settle_xml_changes(self, *, protect_current=False):
         if not self._boxes_dirty:
             return True
-        answer = QMessageBox.question(
-            self, "保存标注修改", f"将当前修改写入 {self._xml_document.path.name}？",
-            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save,
-        )
+        if protect_current:
+            answer = QMessageBox.question(
+                self, "预测 XML 有未保存修改",
+                "当前编辑的文件已被选作只读预测。放弃这些修改并开始对照？",
+                QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel,
+            )
+        else:
+            answer = QMessageBox.question(
+                self, "保存标注修改", f"将当前修改写入 {self._xml_document.path.name}？",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save,
+            )
         if answer == QMessageBox.Save:
             return self._save_xml()
         if answer == QMessageBox.Discard:
@@ -364,12 +386,12 @@ class MainWindow(QMainWindow):
             return True
         return False
 
-    def _prepare_image_change(self):
+    def _prepare_image_change(self, *, protect_current=False):
         if self._slicer_thread is not None and self._slicer_thread.isRunning():
             self.statusBar().showMessage("正在保存切图，请完成后再切换图片。", 5000)
             return False
         self.canvas.cancel_pending_annotation()
-        if not self._settle_xml_changes():
+        if not self._settle_xml_changes(protect_current=protect_current):
             return False
         if self._current_image_path:
             self.project_manager.set_mask(self._current_image_path, self.canvas.get_mask())
@@ -386,8 +408,13 @@ class MainWindow(QMainWindow):
             entry = self._image_entries.get(image_path)
             if entry is None:
                 raise ValueError("图片已移动，请重新打开文件夹。")
-            doc = AnnotationXml.open(entry)
-            if not doc.exists:
+            if self._comparison:
+                pair = self._comparison.resolve(image_path)
+                self._load_prediction(pair.prediction)
+                doc = AnnotationXml.open_path(pair.gt)
+            else:
+                doc = AnnotationXml.open(entry)
+            if not doc.exists and not self._comparison:
                 legacy = self.annotation_store.load(path, width, height)
                 if os.path.isfile(self.annotation_store.sidecar_path(path)):
                     doc.boxes = legacy["boxes"]
@@ -758,6 +785,10 @@ class MainWindow(QMainWindow):
         self._boxes_dirty = False
         self._annotation_load_error = False
         self.canvas.setEnabled(True)
+        self.canvas.set_predictions([])
+        self.prediction_status.clear()
+        self.prediction_status.setToolTip("")
+        self.prediction_status.hide()
         self.canvas.set_annotations([])
         self._show_boxes([])
         self.annotation_save_label.setText("打开图片或文件夹开始标注。")
@@ -780,14 +811,52 @@ class MainWindow(QMainWindow):
                 item.setToolTip(f"左上角 ({x:g}, {y:g})　宽 {w:g}　高 {h:g}")
                 self.review_box_list.addItem(item)
         self._sync_review_selection(self.canvas.selected_annotation)
-        self.box_count_label.setText(f"标注框：{len(boxes)}")
+        self.box_count_label.setText(f"GT 标注框（实线）：{len(boxes)}")
         doc = self._xml_document
         self.save_xml_button.setEnabled(doc is not None and (self._boxes_dirty or not doc.exists))
+
+    def _load_prediction(self, path):
+        self.prediction_status.show()
+        self.prediction_status.setToolTip(str(path))
+        try:
+            boxes = AnnotationXml.open_path(path, must_exist=True).boxes
+        except FileNotFoundError:
+            self.prediction_status.setText("预测（只读）· 本图无匹配 XML")
+            return
+        except (OSError, ValueError) as error:
+            self.prediction_status.setText(f"预测 XML 读取失败：{error}")
+            return
+        self.canvas.set_predictions(boxes)
+        self.prediction_status.setText(f"预测框（青色虚线，只读）：{len(boxes)}")
+
+    def _open_comparison(self):
+        dialog = ComparisonDialog(self._current_image_path, self)
+        while dialog.exec():
+            try:
+                image = dialog.image_path
+                self._open_source(image.parent, image,
+                                  comparison_sources=(dialog.gt_source, dialog.prediction_source))
+            except (OSError, ValueError) as error:
+                QMessageBox.warning(self, "无法打开双 XML 对照", str(error))
+                continue
+            break
+        dialog.deleteLater()
 
     def _open_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "选择图片文件夹（含子目录）")
         if folder:
             self._open_source(Path(folder).resolve())
+
+    def _protect_pending_prediction(self, comparison, selected, paths):
+        if not self._boxes_dirty or comparison is None:
+            return False
+        # The previous single-file review may have opened a model output as editable.
+        old_image = Path(self._current_image_path).resolve()
+        images = {selected}
+        if old_image in paths:
+            images.add(old_image)
+        return any(same_xml_path(self._xml_document.path, comparison.resolve(image).prediction)
+                   for image in images)
 
     def _open_image(self):
         patterns = " ".join(f"*.{ext}" for ext in sorted(image_extensions()))
@@ -807,7 +876,7 @@ class MainWindow(QMainWindow):
                 self.review_image_picker.addItem(name)
             self.review_image_picker.setCurrentIndex(self._image_index)
 
-    def _open_source(self, folder, selected=None):
+    def _open_source(self, folder, selected=None, *, comparison_sources=None):
         selected_xml = selected is not None and selected.suffix.lower() == ".xml"
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
@@ -827,10 +896,16 @@ class MainWindow(QMainWindow):
         if not paths or (selected is not None and selected not in paths):
             QMessageBox.information(self, "没有可显示的图片", "所选位置没有可识别的图片。")
             return
-        if not self._prepare_image_change():
+        comparison = None
+        if comparison_sources is not None:
+            comparison = ComparisonSources(selected, *comparison_sources, images=paths)
+            comparison.resolve(selected)
+        protect_current = self._protect_pending_prediction(comparison, selected, paths)
+        if not self._prepare_image_change(protect_current=protect_current):
             return
-        if selected_xml or selected is None:
+        if selected_xml or selected is None or comparison:
             self.mode_combo.setCurrentIndex(0)
+        self._comparison = comparison
         self._image_entries = {entry.image: entry for entry in entries}
         self._image_list = [str(path) for path in paths]
         self._image_index = paths.index(selected) if selected is not None else 0
@@ -972,6 +1047,7 @@ class MainWindow(QMainWindow):
     def _on_new_project(self):
         if not self._prepare_image_change():
             return
+        self._comparison = None
         self._image_entries = {}
         self.project_manager = ProjectManager()
         self._image_list = []
@@ -993,11 +1069,20 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "打开工程", "", "Project Files (*.json)")
         if not path:
             return
-        if not self._prepare_image_change():
-            return
 
         try:
-            current_index, config, normal_files, abnormal_files = self.project_manager.load_project(path)
+            project = ProjectManager()
+            current_index, config, normal_files, abnormal_files = project.load_project(path)
+            comparison = None
+            protect_current = False
+            if "xml_comparison" in config:
+                comparison = ComparisonSources.from_config(config["xml_comparison"], images=project.images)
+                paths = [Path(p).resolve() for p in project.images]
+                protect_current = self._protect_pending_prediction(comparison, paths[current_index], paths)
+            if not self._prepare_image_change(protect_current=protect_current):
+                return
+            self.project_manager = project
+            self._comparison = comparison
             self._image_entries = {}
             self._current_image_path = None
             self._current_image = None
@@ -1057,6 +1142,8 @@ class MainWindow(QMainWindow):
 
         try:
             config = self._get_current_config()
+            if self._comparison:
+                config["xml_comparison"] = self._comparison.to_config()
 
             # Collect file paths from list widgets
             normal_files = []
