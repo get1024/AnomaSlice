@@ -1,7 +1,8 @@
 """Bind GT and read-only prediction XML sources to a flat list of images."""
 
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+from functools import cache, partial
 from pathlib import Path
 
 
@@ -48,10 +49,10 @@ class _Source:
             return cls(path.parent, path)
         raise ValueError(f"请选择已有的 XML 文件或目录：{path}")
 
-    def match(self, name, is_selected):
+    def match(self, name, is_selected, lookup):
         if is_selected and self.bound_file is not None:
             return self.bound_file
-        return _one_match(_matching_paths(self.directory, name), self.directory / name)
+        return _one_match(lookup(self.directory, name), self.directory / name)
 
     def to_config(self):
         if self.bound_file:
@@ -79,20 +80,20 @@ def _restore_source(value):
     raise ValueError("工程中的对照 XML 来源无效或已移动，请重新选择文件或目录。")
 
 
-def _nearby_matches(root, name):
-    folders = [p for p in _matching_paths(root, "xml") if p.is_dir()]
+def _nearby_matches(root, name, lookup):
+    folders = [p for p in lookup(root, "xml") if p.is_dir()]
     if len(folders) > 1:
         raise ValueError("图片旁有多个名为 xml 的目录，请明确选择对应目录。")
     nested = folders[0] if folders else root / "xml"
-    candidates = _matching_paths(root, name)
+    candidates = list(lookup(root, name))
     if folders:
-        candidates.extend(_matching_paths(nested, name))
+        candidates.extend(lookup(nested, name))
     return candidates, nested / name
 
 
-def _nearby_path(image, name, explicit):
+def _nearby_path(image, name, explicit, lookup):
     # Prefer xml/ when creating a new GT, as in single-source mode.
-    candidates, fallback = _nearby_matches(image.parent, name)
+    candidates, fallback = _nearby_matches(image.parent, name, lookup)
     candidates = [p for p in candidates if p != explicit]
     if same_xml_path(fallback, explicit):
         fallback = image.parent / name
@@ -128,6 +129,25 @@ class ComparisonSources:
 
     def resolve(self, image):
         """Resolve fresh on navigation and before writing. Missing layers have a path."""
+        return self._resolve(image, _matching_paths)
+
+    def scan_resolver(self):
+        """Return a resolver with directory-name indexes local to one read-only scan."""
+        @cache
+        def index(directory):
+            names = defaultdict(list)
+            for path in directory.iterdir():
+                key = path.name.casefold()
+                if key == "xml" or key.endswith(".xml"):
+                    names[key].append(path)
+            return names
+
+        def lookup(directory, name):
+            return index(directory).get(name.casefold(), ())
+
+        return partial(self._resolve, lookup=lookup)
+
+    def _resolve(self, image, lookup):
         image = Path(image).resolve()
         if image not in self._images:
             raise ValueError("图片不在当前 XML 对照列表中。")
@@ -135,14 +155,14 @@ class ComparisonSources:
             raise ValueError(f"{image.stem} 有多张同名图片，无法确定对应 XML。")
         name = image.with_suffix(".xml").name
         is_selected = image == self.selected_image
-        gt = self._gt.match(name, is_selected) if self._gt else None
-        prediction = self._prediction.match(name, is_selected) if self._prediction else None
+        gt = self._gt.match(name, is_selected, lookup) if self._gt else None
+        prediction = self._prediction.match(name, is_selected, lookup) if self._prediction else None
         if is_selected and self._gt and self._gt.bound_file and not gt.is_file():
             raise ValueError(f"指定的 GT 文件已移动，请重新选择：{gt}")
         if gt is None:
-            gt = _nearby_path(image, name, prediction)
+            gt = _nearby_path(image, name, prediction, lookup)
         if prediction is None:
-            prediction = _nearby_path(image, name, gt)
+            prediction = _nearby_path(image, name, gt, lookup)
         if same_xml_path(gt, prediction):
             raise ValueError("GT 与预测指向同一个 XML。请选择不同的文件或目录。")
         if not is_selected:
@@ -157,9 +177,9 @@ class ComparisonSources:
             if stem == image.stem.casefold() or stem not in self._stems:
                 continue
             if self._prediction:
-                candidates = [self._prediction.match(path.name, False)]
+                candidates = [self._prediction.match(path.name, False, lookup)]
             else:
-                candidates, _ = _nearby_matches(image.parent, path.name)
+                candidates, _ = _nearby_matches(image.parent, path.name, lookup)
             if any(same_xml_path(gt, p) for p in candidates):
                 raise ValueError(f"{gt.name} 与另一张图片的预测 XML 冲突。")
         return XmlPair(gt, prediction)

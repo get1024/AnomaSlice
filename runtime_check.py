@@ -2,8 +2,10 @@
 
 import os
 import tempfile
+import time
 from pathlib import Path
 
+from PySide6.QtCore import QCoreApplication
 from PySide6.QtGui import QColor, QImage, QPainter
 
 from annotation_store import LabelCatalog
@@ -59,6 +61,13 @@ def verify_runtime(window):
         if not window.canvas._prediction_items or window.canvas.get_annotations():
             raise RuntimeError("Frozen application did not separate GT and prediction boxes")
         window.canvas.set_annotations(boxes)
+        window.canvas.annotations_changed(boxes)
+        deadline = time.monotonic() + 5
+        while "100.0%" not in window.dataset_recall.text():
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Frozen dataset recall failed: {window.dataset_recall.text()}")
+            QCoreApplication.processEvents()
+            time.sleep(0.01)
         window._on_save_current()
         if not AnnotationXml.open(entry).boxes or model_path.read_bytes() != model_bytes:
             raise RuntimeError("Comparison edits did not save exclusively to GT")

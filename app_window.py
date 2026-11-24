@@ -19,6 +19,7 @@ from annotation_store import AnnotationStore, LabelCatalog
 from bbox_canvas import BoxCanvasMixin
 from comparison_dialog import ComparisonDialog
 from comparison_paths import ComparisonSources, same_xml_path
+from dataset_recall_label import DatasetRecallLabel
 from image_canvas import ScalableImageLabel, SliceCanvas
 from label_dialog import LabelDialog
 from project_store import ProjectManager
@@ -166,6 +167,15 @@ class MainWindow(QMainWindow):
         self.mode_combo.addItems(["框选标注", "切图分类"])
         self.mode_combo.currentIndexChanged.connect(self._set_mode)
         top.addWidget(self.mode_combo)
+        self.dataset_recall = DatasetRecallLabel()
+        top.addWidget(self.dataset_recall)
+        self.recall_rule = QComboBox()
+        self.recall_rule.setAccessibleName("检出率位置匹配条件")
+        self.recall_rule.setToolTip("选择同图 GT 框与预测框的位置匹配条件")
+        self.recall_rule.addItem("有交集", 0.0)
+        self.recall_rule.addItem("小框覆盖率 ≥ 50%", 0.5)
+        self.recall_rule.currentIndexChanged.connect(self._on_recall_rule_changed)
+        top.addWidget(self.recall_rule)
         top.addStretch()
         self.image_position_label = QLabel("打开一张图片后，可继续浏览同文件夹中的图片")
         top.addWidget(self.image_position_label)
@@ -271,6 +281,7 @@ class MainWindow(QMainWindow):
         self.center_stack.setCurrentIndex(index)
         self.gallery.setVisible(not annotation)
         self.canvas.set_annotation_mode(annotation)
+        self._show_dataset_metrics(annotation)
         self.save_project_action.setText("保存 GT XML" if annotation else "保存工程")
         if not annotation:
             self.canvas.ensure_slice_mask()
@@ -436,6 +447,8 @@ class MainWindow(QMainWindow):
             self._refresh_catalog()
         except (OSError, ValueError) as error:
             self._annotation_load_error = True
+            if self._comparison:
+                self.dataset_recall.image_error(path, error)
             self.canvas.setEnabled(False)
             self.annotation_save_label.setText(f"无法编辑标注：{error}")
             self.annotation_save_label.setToolTip(str(error))
@@ -785,6 +798,7 @@ class MainWindow(QMainWindow):
         self._boxes_dirty = False
         self._annotation_load_error = False
         self.canvas.setEnabled(True)
+        self._prediction_boxes = None
         self.canvas.set_predictions([])
         self.prediction_status.clear()
         self.prediction_status.setToolTip("")
@@ -814,6 +828,8 @@ class MainWindow(QMainWindow):
         self.box_count_label.setText(f"GT 标注框（实线）：{len(boxes)}")
         doc = self._xml_document
         self.save_xml_button.setEnabled(doc is not None and (self._boxes_dirty or not doc.exists))
+        if self._comparison and doc is not None and self._prediction_boxes is not None:
+            self.dataset_recall.update_image(self._current_image_path, boxes, self._prediction_boxes)
 
     def _load_prediction(self, path):
         self.prediction_status.show()
@@ -821,11 +837,14 @@ class MainWindow(QMainWindow):
         try:
             boxes = AnnotationXml.open_path(path, must_exist=True).boxes
         except FileNotFoundError:
+            self._prediction_boxes = []
             self.prediction_status.setText("预测（只读）· 本图无匹配 XML")
             return
         except (OSError, ValueError) as error:
+            self.dataset_recall.image_error(self._current_image_path, error)
             self.prediction_status.setText(f"预测 XML 读取失败：{error}")
             return
+        self._prediction_boxes = boxes
         self.canvas.set_predictions(boxes)
         self.prediction_status.setText(f"预测框（青色虚线，只读）：{len(boxes)}")
 
@@ -908,6 +927,7 @@ class MainWindow(QMainWindow):
         self._comparison = comparison
         self._image_entries = {entry.image: entry for entry in entries}
         self._image_list = [str(path) for path in paths]
+        self._start_dataset_metrics()
         self._image_index = paths.index(selected) if selected is not None else 0
         self._populate_image_picker(folder)
         self.project_manager.set_images(self._image_list)
@@ -925,6 +945,22 @@ class MainWindow(QMainWindow):
         self.normal_path_label.setText(normal_dir)
         self.abnormal_path_label.setText(abnormal_dir)
         self._load_current_image()
+
+    def _start_dataset_metrics(self):
+        self.dataset_recall.start_dataset(self._image_list, self._comparison, self.recall_rule.currentData())
+        self._show_dataset_metrics(self.mode_combo.currentIndex() == 0)
+
+    def _show_dataset_metrics(self, annotation_mode):
+        visible = annotation_mode and self._comparison is not None
+        self.dataset_recall.setVisible(visible)
+        self.recall_rule.setVisible(visible)
+
+    def _on_recall_rule_changed(self):
+        if self._comparison is None:
+            return
+        self._start_dataset_metrics()
+        if self._xml_document is not None and self._prediction_boxes is not None:
+            self.dataset_recall.update_image(self._current_image_path, self.canvas.get_annotations(), self._prediction_boxes)
 
     def _schedule_param_update(self):
         self._param_update_timer.start()
@@ -1049,6 +1085,7 @@ class MainWindow(QMainWindow):
             return
         self._comparison = None
         self._image_entries = {}
+        self._start_dataset_metrics()
         self.project_manager = ProjectManager()
         self._image_list = []
         self._image_index = -1
@@ -1094,6 +1131,7 @@ class MainWindow(QMainWindow):
             self._apply_config(config)
 
             self._image_list = self.project_manager.images
+            self._start_dataset_metrics()
             self._image_index = current_index
             self._populate_image_picker()
 
@@ -1220,6 +1258,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._save_global_config()
+        self.dataset_recall.stop_scans()
         super().closeEvent(event)
 
     def _get_global_config_path(self):
