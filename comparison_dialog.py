@@ -1,67 +1,100 @@
-"""Choose an image and assign editable GT and read-only prediction XML sources."""
+"""Open an annotation dataset and optionally attach GT and prediction XML sources."""
 
+import os
 from pathlib import Path
 
 from PySide6.QtGui import QImageReader
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFileDialog, QGridLayout, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QVBoxLayout,
+    QMenu, QMessageBox, QToolButton, QVBoxLayout,
 )
 
 from xml_annotations import image_extensions
 
 
 class ComparisonDialog(QDialog):
-    def __init__(self, image=None, parent=None):
+    def __init__(self, source=None, parent=None, *, gt_source=None, prediction_source=None,
+                 active_dataset=False, binding_image=None):
         super().__init__(parent)
-        self.setWindowTitle("打开 GT 与预测对照")
+        self.setWindowTitle("打开标注数据")
         self.image_path = self.gt_source = self.prediction_source = None
         layout = QVBoxLayout(self)
         grid = QGridLayout()
         layout.addLayout(grid)
-        self.image_edit = QLineEdit(str(image) if image else "")
-        self.image_edit.setPlaceholderText("选择要对照的图片")
-        grid.addWidget(QLabel("图片"), 0, 0)
-        grid.addWidget(self.image_edit, 0, 1)
-        image_button = QPushButton("选择图片…")
-        image_button.clicked.connect(self._choose_image)
-        grid.addWidget(image_button, 0, 2, 1, 2)
-
-        self.gt_edit = self._add_source_row(grid, 1, "GT（可编辑）")
-        self.prediction_edit = self._add_source_row(grid, 2, "模型预测（只读）")
+        self.image_edit = self._add_row(grid, 0, "图片或文件夹", source,
+                                        "图片文件夹、单张图片或对应的 XML")
+        self.gt_edit = self._add_row(grid, 1, "GT（可编辑）", gt_source,
+                                     "自动匹配 · 也可指定 GT 的 XML 文件夹或文件")
+        self.prediction_edit = self._add_row(grid, 2, "模型预测（只读）", prediction_source,
+                                             "可选 · 指定预测 XML 文件夹或文件")
         grid.setColumnStretch(1, 1)
-        hint = QLabel("选择文件夹时按图片名匹配 XML。可将其中一项留空，"
-                      "在图片所在目录及其 xml 子目录中查找同名 XML。")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        self._xml_owners = {edit: self._source_key() for edit in (self.gt_edit, self.prediction_edit)}
+        self._current_source = self._source_key() if active_dataset else None
+        self._binding_image = Path(binding_image) if binding_image else None
+        for edit in self._xml_owners:
+            edit.textChanged.connect(lambda _, field=edit: self._remember_source(field))
+        self.image_edit.editingFinished.connect(self._clear_stale_sources)
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self._update_hint()
+        layout.addWidget(self.hint)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("打开对照")
+        buttons.button(QDialogButtonBox.Ok).setText("打开")
         buttons.button(QDialogButtonBox.Cancel).setText("取消")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.resize(650, self.sizeHint().height())
 
-    def _add_source_row(self, grid, row, label):
-        edit = QLineEdit()
-        edit.setPlaceholderText("XML 文件或所在文件夹")
-        grid.addWidget(QLabel(label), row, 0)
+    def _add_row(self, grid, row, label, value, placeholder):
+        edit = QLineEdit(str(value) if value else "")
+        edit.setPlaceholderText(placeholder)
+        edit.setClearButtonEnabled(True)
+        caption = QLabel(label)
+        caption.setBuddy(edit)
+        grid.addWidget(caption, row, 0)
         grid.addWidget(edit, row, 1)
-        file_button = QPushButton("选文件…")
-        file_button.clicked.connect(lambda: self._choose_xml(edit, label))
-        grid.addWidget(file_button, row, 2)
-        folder_button = QPushButton("选文件夹…")
-        folder_button.clicked.connect(lambda: self._choose_folder(edit, label))
-        grid.addWidget(folder_button, row, 3)
+        button = QToolButton()
+        button.setText("选文件夹…")
+        button.setAccessibleName(f"选择{label}来源")
+        button.setPopupMode(QToolButton.MenuButtonPopup)
+        button.clicked.connect(lambda: self._choose_folder(edit, label))
+        menu = QMenu(button)
+        file_action = menu.addAction("选图片或 XML 文件…" if row == 0 else "选 XML 文件…")
+        file_action.triggered.connect(lambda: self._choose_file(edit, label))
+        button.setMenu(menu)
+        grid.addWidget(button, row, 2)
         return edit
 
-    def _choose_image(self):
-        patterns = " ".join(f"*.{ext}" for ext in sorted(image_extensions()))
-        path, _ = QFileDialog.getOpenFileName(self, "选择图片", self.image_edit.text(),
-                                              f"图片 ({patterns});;所有文件 (*)")
-        if path:
-            self.image_edit.setText(path)
+    def _source_key(self):
+        text = self.image_edit.text().strip()
+        return os.path.normcase(os.path.abspath(os.path.expanduser(text))) if text else None
+
+    def _remember_source(self, field):
+        self._xml_owners[field] = self._source_key()
+
+    def _update_hint(self):
+        current = self._current_source and self._source_key() == self._current_source
+        intro = ("可直接更改当前图片列表的 XML 来源。" if current
+                 else "只选图片或文件夹即可开始标注。")
+        self.hint.setText(intro + "对照模型结果时，通常只需再选预测文件夹。")
+        if current and self._binding_image:
+            binding = f"单个 XML 绑定到 {self._binding_image.name}。"
+        else:
+            binding = "打开新文件夹时，单个 XML 绑定到唯一同名图片。异名 XML 请从对应图片打开。"
+        source_help = ("选目录时按每张图的文件名匹配。指定一项 XML 来源后，"
+                       "另一项会在图片旁及其 xml 子目录中查找。")
+        for widget in (self.hint, self.gt_edit, self.prediction_edit):
+            widget.setToolTip(binding + source_help)
+
+    def _clear_stale_sources(self):
+        current = self._source_key()
+        for edit, previous in self._xml_owners.items():
+            if previous and previous != current:
+                edit.clear()
+            self._xml_owners[edit] = current
+        self._update_hint()
 
     def _start_directory(self, edit):
         text = edit.text().strip() or self.image_edit.text().strip()
@@ -70,17 +103,26 @@ class ComparisonDialog(QDialog):
         path = Path(text).expanduser()
         return str(path if path.is_dir() else path.parent)
 
-    def _choose_xml(self, edit, label):
-        path, _ = QFileDialog.getOpenFileName(self, f"选择{label} XML",
-                                              self._start_directory(edit), "XML 文件 (*.xml)")
+    def _choose_file(self, edit, label):
+        file_filter = "XML 文件 (*.xml)"
+        title = f"选择{label} XML 文件"
+        if edit is self.image_edit:
+            patterns = " ".join(f"*.{ext}" for ext in sorted(image_extensions()))
+            file_filter = f"图片或 XML ({patterns} *.xml);;所有文件 (*)"
+            title = "选择图片或同名 XML"
+        path, _ = QFileDialog.getOpenFileName(self, title, self._start_directory(edit), file_filter)
         if path:
             edit.setText(path)
+            if edit is self.image_edit:
+                self._clear_stale_sources()
 
     def _choose_folder(self, edit, label):
-        path = QFileDialog.getExistingDirectory(self, f"选择{label} XML 文件夹",
-                                                self._start_directory(edit))
+        title = "选择图片文件夹（含子目录）" if edit is self.image_edit else f"选择{label} XML 文件夹"
+        path = QFileDialog.getExistingDirectory(self, title, self._start_directory(edit))
         if path:
             edit.setText(path)
+            if edit is self.image_edit:
+                self._clear_stale_sources()
 
     @staticmethod
     def _source(edit, label):
@@ -94,17 +136,20 @@ class ComparisonDialog(QDialog):
 
     def accept(self):
         try:
-            image = Path(self.image_edit.text().strip()).expanduser().resolve()
-            if not image.is_file() or not QImageReader(str(image)).canRead():
-                raise ValueError("请选择支持的图片文件。")
+            text = self.image_edit.text().strip()
+            if not text:
+                raise ValueError("请选择图片、图片文件夹或同名 XML。")
+            image = Path(text).expanduser().resolve()
+            if not image.is_dir() and not (image.is_file() and (
+                    image.suffix.lower() == ".xml" or QImageReader(str(image)).canRead())):
+                raise ValueError("请选择已有的图片、图片文件夹或同名 XML。")
+            self._clear_stale_sources()
             gt = self._source(self.gt_edit, " GT")
             prediction = self._source(self.prediction_edit, "模型预测")
-            if gt is None and prediction is None:
-                raise ValueError("请至少指定 GT 或模型预测的一项 XML 来源。")
             if gt and prediction and gt.samefile(prediction):
                 raise ValueError("GT 与预测使用了同一来源，请分别指定各自的 XML 文件或文件夹。")
         except (OSError, RuntimeError, ValueError) as error:
-            QMessageBox.warning(self, "无法打开对照", str(error))
+            QMessageBox.warning(self, "无法打开标注数据", str(error))
             return
         self.image_path = image
         self.gt_source = gt

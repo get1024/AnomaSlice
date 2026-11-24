@@ -232,7 +232,7 @@ class AnnotationXml:
             minidom.parseString(encoded).unlink()
         except ExpatError as error:
             raise ValueError(f"标签含 XML 无法保存的字符：{error}") from error
-        self.path.parent.mkdir(exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         # Serialize cooperating reviewers, then check that the source on disk is still ours.
         lock = QLockFile(str(self.path) + ".anomaslice.lock")
         if not lock.tryLock(0):

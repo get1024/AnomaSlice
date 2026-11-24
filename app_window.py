@@ -18,13 +18,13 @@ from PySide6.QtWidgets import (
 from annotation_store import AnnotationStore, LabelCatalog
 from bbox_canvas import BoxCanvasMixin
 from comparison_dialog import ComparisonDialog
-from comparison_paths import ComparisonSources, same_xml_path
+from comparison_paths import ComparisonSources
 from dataset_recall_label import DatasetRecallLabel
 from image_canvas import ScalableImageLabel, SliceCanvas
 from label_dialog import LabelDialog
 from project_store import ProjectManager
 from slicer import SlicerThread
-from xml_annotations import AnnotationXml, image_extensions, scan_folder
+from xml_annotations import AnnotationXml, ImageEntry, scan_folder
 
 
 class CanvasWidget(BoxCanvasMixin, SliceCanvas):
@@ -46,6 +46,7 @@ class MainWindow(QMainWindow):
         self._image_list = []
         self._image_index = -1
         self._image_entries = {}
+        self._dataset_source = None
         self._xml_document = None
         self._comparison = None
         self._thumbnail_queue = { }
@@ -92,13 +93,9 @@ class MainWindow(QMainWindow):
         # Initialize Canvas early for signal connections
         self.canvas = CanvasWidget()
 
-        self.open_image_action = QAction("打开图片或 XML…", self)
-        self.open_image_action.setShortcut("Ctrl+I")
-        self.open_image_action.triggered.connect(self._open_image)
-        self.open_folder_action = QAction("打开图片文件夹…", self)
-        self.open_folder_action.triggered.connect(self._open_folder)
-        self.compare_xml_action = QAction("打开双 XML 对照…", self)
-        self.compare_xml_action.triggered.connect(self._open_comparison)
+        self.open_dataset_action = QAction("打开数据集…", self)
+        self.open_dataset_action.setShortcut("Ctrl+I")
+        self.open_dataset_action.triggered.connect(self._open_dataset)
 
         self.slice_and_next_action = QAction("Slice and Next", self)
         self.slice_and_next_action.setShortcut("Return")
@@ -109,9 +106,7 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("文件")
-        file_menu.addAction(self.open_image_action)
-        file_menu.addAction(self.open_folder_action)
-        file_menu.addAction(self.compare_xml_action)
+        file_menu.addAction(self.open_dataset_action)
         file_menu.addSeparator()
         file_menu.addAction(self.new_project_action)
         file_menu.addAction(self.open_project_action)
@@ -192,15 +187,9 @@ class MainWindow(QMainWindow):
         title = QLabel("人工框选标注")
         title.setStyleSheet("font-weight: bold; font-size: 18px;")
         layout.addWidget(title)
-        open_button = QPushButton("打开图片或 XML…  (Ctrl+I)")
-        open_button.clicked.connect(self._open_image)
+        open_button = QPushButton("打开数据集…  (Ctrl+I)")
+        open_button.clicked.connect(self.open_dataset_action.trigger)
         layout.addWidget(open_button)
-        open_folder = QPushButton("打开文件夹…")
-        open_folder.clicked.connect(self._open_folder)
-        layout.addWidget(open_folder)
-        compare = QPushButton("打开双 XML 对照…")
-        compare.clicked.connect(self._open_comparison)
-        layout.addWidget(compare)
         self.annotation_image_label = QLabel("尚未打开图片")
         self.annotation_image_label.setWordWrap(True)
         self.annotation_image_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -401,9 +390,9 @@ class MainWindow(QMainWindow):
         if self._slicer_thread is not None and self._slicer_thread.isRunning():
             self.statusBar().showMessage("正在保存切图，请完成后再切换图片。", 5000)
             return False
-        self.canvas.cancel_pending_annotation()
         if not self._settle_xml_changes(protect_current=protect_current):
             return False
+        self.canvas.cancel_pending_annotation()
         if self._current_image_path:
             self.project_manager.set_mask(self._current_image_path, self.canvas.get_mask())
         return True
@@ -656,8 +645,8 @@ class MainWindow(QMainWindow):
         action_layout.setContentsMargins(5, 5, 5, 5)
         action_layout.setSpacing(5)
 
-        self.open_image_btn = QPushButton("打开图片/文件夹")
-        self.open_image_btn.clicked.connect(self._open_image)
+        self.open_image_btn = QPushButton("打开数据集…")
+        self.open_image_btn.clicked.connect(self.open_dataset_action.trigger)
 
         self.clear_mask_button = QPushButton("清除")
         self.clear_mask_button.clicked.connect(self.canvas.clear_mask)
@@ -848,44 +837,87 @@ class MainWindow(QMainWindow):
         self.canvas.set_predictions(boxes)
         self.prediction_status.setText(f"预测框（青色虚线，只读）：{len(boxes)}")
 
-    def _open_comparison(self):
-        dialog = ComparisonDialog(self._current_image_path, self)
+    def _open_dataset(self):
+        active = bool(self._image_list)
+        anchor = Path(self._image_list[self._image_index]).resolve() if active else None
+        gt = prediction = None
+        if self._comparison:
+            anchor = self._comparison.selected_image
+            gt, prediction = self._comparison.source_paths_for(anchor)
+        elif self._xml_document and self._xml_document.exists:
+            path = self._xml_document.path
+            if path.parent not in (anchor.parent, anchor.parent / "xml"):
+                gt = path.parent if path.stem.casefold() == anchor.stem.casefold() else path
+        dialog = ComparisonDialog(self._dataset_source, self, gt_source=gt, prediction_source=prediction,
+                                  active_dataset=active, binding_image=anchor)
         while dialog.exec():
             try:
-                image = dialog.image_path
-                self._open_source(image.parent, image,
-                                  comparison_sources=(dialog.gt_source, dialog.prediction_source))
+                source = dialog.image_path
+                roles = (dialog.gt_source, dialog.prediction_source)
+                if active and source == self._dataset_source:
+                    if roles != (gt, prediction):
+                        self._change_xml_sources(anchor, roles)
+                else:
+                    self._open_dataset_path(source, roles)
             except (OSError, ValueError) as error:
-                QMessageBox.warning(self, "无法打开双 XML 对照", str(error))
+                QMessageBox.warning(self, "无法打开数据集", str(error))
                 continue
             break
         dialog.deleteLater()
 
-    def _open_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "选择图片文件夹（含子目录）")
-        if folder:
-            self._open_source(Path(folder).resolve())
+    def _open_dataset_path(self, source, roles=(None, None)):
+        selected = None if source.is_dir() else source
+        root = source if selected is None else source.parent
+        if selected and selected.suffix.casefold() == ".xml" and root.name.casefold() == "xml":
+            root = root.parent
+        self._open_source(root, selected, comparison_sources=roles if any(roles) else None)
 
-    def _protect_pending_prediction(self, comparison, selected, paths):
-        if not self._boxes_dirty or comparison is None:
-            return False
-        # The previous single-file review may have opened a model output as editable.
-        old_image = Path(self._current_image_path).resolve()
-        images = {selected}
-        if old_image in paths:
-            images.add(old_image)
-        return any(same_xml_path(self._xml_document.path, comparison.resolve(image).prediction)
-                   for image in images)
+    def _protect_pending_prediction(self, comparison):
+        return bool(self._boxes_dirty and comparison and comparison.protects_prediction(self._xml_document.path))
 
-    def _open_image(self):
-        patterns = " ".join(f"*.{ext}" for ext in sorted(image_extensions()))
-        path, _ = QFileDialog.getOpenFileName(self, "选择图片或缺陷 XML", "", f"图片和标注 ({patterns} *.xml);;所有文件 (*)")
-        if path:
-            selected = Path(path).resolve()
-            root = selected.parent
-            if selected.suffix.lower() == ".xml" and root.name.casefold() == "xml":
-                root = root.parent
-            self._open_source(root, selected)
+    def _plain_gt_targets(self):
+        for path in self._image_list:
+            image = Path(path).resolve()
+            entry = self._image_entries.get(image) or ImageEntry(image)
+            try:
+                yield entry.target()
+            except ValueError:
+                continue  # Ambiguous entries cannot be edited in plain mode.
+
+    def _change_xml_sources(self, anchor, roles):
+        current = Path(self._image_list[self._image_index]).resolve()
+        comparison = None
+        if any(roles):
+            root = self._dataset_source if self._dataset_source.is_dir() else None
+            comparison = ComparisonSources(anchor, *roles, images=self._image_list, image_root=root)
+            pair = comparison.resolve(current)
+            target = pair.gt
+        else:
+            entry = self._image_entries.get(current)
+            target = entry.target() if entry else None
+            if self._comparison:
+                conflict = self._comparison.first_protected_target(self._plain_gt_targets())
+                if conflict:
+                    raise ValueError(f"自动匹配会将预测文件 {conflict} 用作 GT。请指定 GT 来源。")
+        protect = self._protect_pending_prediction(comparison)
+        keep_gt = self._xml_document is not None and self._xml_document.path == target and not protect
+        if not keep_gt and not self._prepare_image_change(protect_current=protect):
+            return
+        self._comparison = comparison
+        self.mode_combo.setCurrentIndex(0)
+        self._start_dataset_metrics()
+        if keep_gt:
+            # Replacing the overlay preserves the editable document, undo stack and zoom.
+            self.canvas.set_predictions([])
+            self._prediction_boxes = None
+            self.prediction_status.hide()
+            if comparison:
+                self._load_prediction(pair.prediction)
+            self._show_boxes(self.canvas.get_annotations())
+        elif self._current_image is not None:
+            self._load_annotations(self._current_image_path, self._current_image.width(), self._current_image.height())
+        else:
+            self._load_current_image()
 
     def _populate_image_picker(self, root=None):
         with QSignalBlocker(self.review_image_picker):
@@ -896,35 +928,38 @@ class MainWindow(QMainWindow):
             self.review_image_picker.setCurrentIndex(self._image_index)
 
     def _open_source(self, folder, selected=None, *, comparison_sources=None):
+        source = selected or folder
         selected_xml = selected is not None and selected.suffix.lower() == ".xml"
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             entries = scan_folder(folder, recursive=selected is None or selected_xml)
-        except OSError as error:
-            QMessageBox.warning(self, "无法扫描文件夹", str(error))
-            return
         finally:
             QApplication.restoreOverrideCursor()
         if selected_xml:
             matches = [entry for entry in entries if entry.xml == selected]
             if len(matches) != 1:
-                QMessageBox.warning(self, "无法匹配图片", "未找到唯一对应的图片。请打开包含图片和 XML 的上级文件夹。")
-                return
+                raise ValueError("未找到 XML 唯一对应的图片。请选择图片或图片文件夹，再指定 XML 来源。")
             selected = matches[0].image
         paths = [entry.image for entry in entries]
         if not paths or (selected is not None and selected not in paths):
-            QMessageBox.information(self, "没有可显示的图片", "所选位置没有可识别的图片。")
-            return
+            raise ValueError("所选位置没有可识别的图片。")
         comparison = None
         if comparison_sources is not None:
-            comparison = ComparisonSources(selected, *comparison_sources, images=paths)
-            comparison.resolve(selected)
-        protect_current = self._protect_pending_prediction(comparison, selected, paths)
+            gt, prediction = comparison_sources
+            if selected_xml and gt is None and source != prediction:
+                gt = source
+            anchor = selected or self._folder_anchor(paths, (gt, prediction))
+            comparison = ComparisonSources(anchor, gt, prediction, images=paths,
+                                           image_root=folder if source == folder else None)
+            comparison.resolve(anchor)
+            selected = anchor
+        protect_current = self._protect_pending_prediction(comparison)
         if not self._prepare_image_change(protect_current=protect_current):
             return
-        if selected_xml or selected is None or comparison:
+        if selected_xml or comparison:
             self.mode_combo.setCurrentIndex(0)
         self._comparison = comparison
+        self._dataset_source = source
         self._image_entries = {entry.image: entry for entry in entries}
         self._image_list = [str(path) for path in paths]
         self._start_dataset_metrics()
@@ -945,6 +980,24 @@ class MainWindow(QMainWindow):
         self.normal_path_label.setText(normal_dir)
         self.abnormal_path_label.setText(abnormal_dir)
         self._load_current_image()
+
+    @staticmethod
+    def _folder_anchor(images, roles):
+        if len(images) == 1:
+            return images[0]
+        owners = set()
+        for source in roles:
+            if source and source.is_file():
+                matches = [p for p in images if p.stem.casefold() == source.stem.casefold()]
+                if len(matches) == 1:
+                    owners.add(matches[0])
+                elif matches:
+                    raise ValueError(f"{source.name} 对应多张图片，请选择具体图片或指定 XML 文件夹。")
+        if len(owners) == 1:
+            return owners.pop()
+        if any(p and p.is_file() for p in roles):
+            raise ValueError("无法确定单个 XML 对应的起始图片。请选择具体图片或指定 XML 文件夹。")
+        return images[0]
 
     def _start_dataset_metrics(self):
         self.dataset_recall.start_dataset(self._image_list, self._comparison, self.recall_rule.currentData())
@@ -1084,6 +1137,7 @@ class MainWindow(QMainWindow):
         if not self._prepare_image_change():
             return
         self._comparison = None
+        self._dataset_source = None
         self._image_entries = {}
         self._start_dataset_metrics()
         self.project_manager = ProjectManager()
@@ -1114,8 +1168,7 @@ class MainWindow(QMainWindow):
             protect_current = False
             if "xml_comparison" in config:
                 comparison = ComparisonSources.from_config(config["xml_comparison"], images=project.images)
-                paths = [Path(p).resolve() for p in project.images]
-                protect_current = self._protect_pending_prediction(comparison, paths[current_index], paths)
+                protect_current = self._protect_pending_prediction(comparison)
             if not self._prepare_image_change(protect_current=protect_current):
                 return
             self.project_manager = project
@@ -1131,6 +1184,16 @@ class MainWindow(QMainWindow):
             self._apply_config(config)
 
             self._image_list = self.project_manager.images
+            saved_source = config.get("dataset_source")
+            saved_path = Path(saved_source) if isinstance(saved_source, str) else None
+            self._dataset_source = saved_path if saved_path and saved_path.is_absolute() and saved_path.exists() else None
+            if self._dataset_source is None and comparison:
+                self._dataset_source = comparison.image_root
+            if project.images and self._dataset_source is None:
+                try:
+                    self._dataset_source = Path(os.path.commonpath([Path(p).resolve().parent for p in project.images]))
+                except ValueError:  # An existing project can span multiple Windows drives.
+                    self._dataset_source = Path(project.images[current_index]).resolve()
             self._start_dataset_metrics()
             self._image_index = current_index
             self._populate_image_picker()
@@ -1180,6 +1243,8 @@ class MainWindow(QMainWindow):
 
         try:
             config = self._get_current_config()
+            if self._dataset_source:
+                config["dataset_source"] = str(self._dataset_source)
             if self._comparison:
                 config["xml_comparison"] = self._comparison.to_config()
 

@@ -45,8 +45,7 @@ class AppWorkflowTests(unittest.TestCase):
             image.fill(QColor(100, 100, 100))
             self.assertTrue(image.save(str(path)))
             self.images.append(str(path))
-        with patch("app_window.QFileDialog.getOpenFileName", return_value=(self.images[0], "")):
-            self.window._open_image()
+        self.window._open_dataset_path(Path(self.images[0]))
         self.app.processEvents()
 
     def tearDown(self):
@@ -162,8 +161,7 @@ class AppWorkflowTests(unittest.TestCase):
         <Detection index="2" camera="B"><x>20</x><y>30</y><width>60</width><height>70</height><message>污渍</message><confidence>0.789000</confidence><color>#0000FF</color><extra>原始记录</extra></Detection>
         </Detections></DefectDetection>"""
         path.write_text(original, encoding="utf-8")
-        with patch("app_window.QFileDialog.getExistingDirectory", return_value=str(self.root)):
-            self.window._open_folder()
+        self.window._open_dataset_path(self.root)
         self.window.review_image_picker.setCurrentIndex(self.window._image_list.index(str(image)))
         canvas = self.window.canvas
         self.assertEqual(canvas._annotation_items[0].rect(), QRectF(20, 30, 60, 70))
@@ -187,8 +185,7 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertEqual((first.get("index"), first.get("camera"), first.findtext("extra")), ("1", "B", "原始记录"))
         self.assertEqual((first.findtext("message"), first.findtext("confidence")), ("复核划痕", "0.789000"))
         self.assertEqual((second.get("index"), second.findtext("message")), ("2", "人工补标"))
-        with patch("app_window.QFileDialog.getOpenFileName", return_value=(str(path), "")):
-            self.window._open_image()
+        self.window._open_dataset_path(path)
         self.assertEqual(self.window._current_image_path, str(image))
         self.assertEqual([b["label"] for b in canvas.get_annotations()], ["复核划痕", "人工补标"])
 
