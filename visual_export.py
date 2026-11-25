@@ -1,12 +1,17 @@
 """Draw annotation exports in original image coordinates with Qt."""
 
+import errno
+import os
+import shutil
 import sys
+import tempfile
+from itertools import count
 from pathlib import Path
 
-from PySide6.QtCore import QIODevice, QRectF, QSaveFile, Qt
+from PySide6.QtCore import QFile, QIODevice, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QImageWriter, QPainter, QPen
 
-from xml_annotations import label_color
+from xml_annotations import EXPORT_PNG_KEY, label_color
 
 
 def iter_visual_exports(image, gt_boxes, prediction_boxes, *, crops, layers, selected=None):
@@ -128,15 +133,79 @@ def _draw_caption(painter, bounds, metrics, box, name, caption, color, predictio
     painter.drawText(badge.adjusted(padding, 0, -padding, 0), Qt.AlignVCenter | Qt.AlignLeft, caption)
 
 
-def save_png(image, path):
-    """Atomically replace a PNG only after its entire image has been encoded."""
+def _macos_rename_exclusive(temporary, destination):
+    import ctypes
+    rename = ctypes.CDLL(None, use_errno=True).renamex_np
+    rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+    if rename(os.fsencode(temporary), os.fsencode(destination), 0x00000004):  # RENAME_EXCL
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), str(destination))
+
+
+def _publish_new_file(temporary, destination):
+    """Publish without ever opening an existing destination for writing."""
+    if sys.platform == "win32":
+        os.rename(temporary, destination)  # MoveFileEx without REPLACE_EXISTING.
+        return
+    unsupported = {errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS, errno.EINVAL}
+    if sys.platform == "darwin":
+        try:
+            _macos_rename_exclusive(temporary, destination)
+            return
+        except OSError as error:
+            if error.errno not in unsupported:
+                raise
+    try:
+        os.link(temporary, destination)
+        return
+    except OSError as error:
+        if error.errno not in unsupported and error.errno != errno.EPERM:
+            raise
+
+    # Some removable volumes and network shares support neither operation.
+    # Acquire the name exclusively and write only to the descriptor we created.
+    created = None
+    try:
+        with open(temporary, "rb") as source, destination.open("xb") as output:
+            created = os.fstat(output.fileno())
+            shutil.copyfileobj(source, output)
+    except BaseException:
+        if created is not None and destination.exists() and os.path.samestat(created, destination.lstat()):
+            destination.unlink(missing_ok=True)
+        raise
+
+
+def save_png(image, path, *, occupied=None):
+    """Publish a complete PNG under the first available name, without replacement."""
     path = Path(path)
-    destination = QSaveFile(str(path))
-    if not destination.open(QIODevice.WriteOnly):
-        raise OSError(f"{path.name}：{destination.errorString()}")
-    writer = QImageWriter(destination, b"png")
-    if not writer.write(image):
-        destination.cancelWriting()
-        raise OSError(f"{path.name}：{writer.errorString()}")
-    if not destination.commit():
-        raise OSError(f"{path.name}：{destination.errorString()}")
+    if occupied is None:
+        occupied = {p.name.casefold() for p in path.parent.iterdir()}
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".anomaslice-write-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            device = QFile()
+            if not device.open(stream.fileno(), QIODevice.WriteOnly):
+                raise OSError(f"{path.name}：{device.errorString()}")
+            try:
+                writer = QImageWriter(device, b"png")
+                writer.setText(EXPORT_PNG_KEY, "1")
+                if not writer.write(image):
+                    raise OSError(f"{path.name}：{writer.errorString()}")
+                if not device.flush():
+                    raise OSError(f"{path.name}：{device.errorString()}")
+            finally:
+                device.close()
+        for number in count(1):
+            candidate = path if number == 1 else path.with_name(f"{path.stem} ({number}){path.suffix}")
+            key = candidate.name.casefold()
+            if key in occupied:
+                continue
+            try:
+                _publish_new_file(temporary, candidate)
+            except FileExistsError:
+                occupied.add(key)
+                continue
+            occupied.add(key)
+            return candidate
+    finally:
+        Path(temporary).unlink(missing_ok=True)

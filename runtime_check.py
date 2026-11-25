@@ -1,10 +1,12 @@
 """Exercise frozen image codecs, metadata, project hashing, and crop export."""
 
 import os
+import ssl
 import tempfile
 import time
 from pathlib import Path
 
+import certifi
 from PySide6.QtCore import QCoreApplication, QEvent, QPointF, Qt
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter
 from PySide6.QtWidgets import QPushButton
@@ -71,6 +73,8 @@ def _check_label_dialog(window):
 
 
 def verify_runtime(window):
+    # The updater needs a working TLS backend and CA bundle on the recipient's machine.
+    ssl.create_default_context().load_verify_locations(cafile=certifi.where())
     with tempfile.TemporaryDirectory(prefix="AnomaSlice-check-") as temp_path:
         directory = Path(temp_path).resolve()
         image_path = os.path.join(directory, "测试图片.png")

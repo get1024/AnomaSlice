@@ -4,6 +4,7 @@ import os
 import shutil
 import json
 import sys
+from tempfile import TemporaryDirectory
 from pathlib import Path
 
 from PySide6.QtCore import QRectF, QSignalBlocker, Qt, QTimer
@@ -27,6 +28,8 @@ from image_canvas import ScalableImageLabel, SliceCanvas
 from label_dialog import LabelDialog
 from project_store import ProjectManager, json_write_lock, write_json_atomic
 from slicer import SlicerThread
+from update_dialog import UpdateDialog
+from update_install import launch_update
 from xml_annotations import AnnotationXml, ImageEntry, scan_folder
 
 
@@ -57,6 +60,8 @@ class MainWindow(QMainWindow):
         self._thumbnail_timer = None
         self._slicer_thread = None
         self._export_thread = None
+        self._pending_update = None
+        self._update_dialog = None
         self._patch_coords = []
         self._current_patch_index = 0
         self._create_actions()
@@ -126,6 +131,11 @@ class MainWindow(QMainWindow):
         edit_menu = menubar.addMenu("编辑")
         edit_menu.addAction(self.undo_action)
         edit_menu.addAction(self.redo_action)
+
+        help_menu = menubar.addMenu("帮助")
+        self.update_action = help_menu.addAction("检查更新…")
+        self.update_action.setMenuRole(QAction.NoRole)
+        self.update_action.triggered.connect(self._check_for_updates)
 
         # Main Layout with Splitter
         self.main_splitter = QSplitter(Qt.Horizontal)
@@ -983,7 +993,7 @@ class MainWindow(QMainWindow):
         selected_xml = selected is not None and selected.suffix.lower() == ".xml"
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            entries = scan_folder(folder, recursive=selected is None or selected_xml)
+            entries = scan_folder(folder, recursive=selected is None or selected_xml, selected=selected)
         finally:
             QApplication.restoreOverrideCursor()
         if selected_xml:
@@ -1275,15 +1285,14 @@ class MainWindow(QMainWindow):
 
     def _on_save_project(self):
         if self.project_manager.project_path:
-            self._save_project_impl(self.project_manager.project_path)
-        else:
-            self._on_save_project_as()
+            return self._save_project_impl(self.project_manager.project_path)
+        return self._on_save_project_as()
 
     def _on_save_project_as(self):
         path, _ = QFileDialog.getSaveFileName(self, "保存工程", "", "Project Files (*.json)")
         if not path:
-            return
-        self._save_project_impl(path)
+            return False
+        return self._save_project_impl(path)
 
     def _save_project_impl(self, path):
         from PySide6.QtWidgets import QMessageBox
@@ -1314,10 +1323,12 @@ class MainWindow(QMainWindow):
             self.project_manager.save_project(path, self._image_index, config, normal_files, abnormal_files)
             self.setWindowTitle(f"Industrial Image Slicer & Annotator - {os.path.basename(path)}")
             QMessageBox.information(self, "提示", "工程保存成功")
+            return True
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存工程失败: {str(e)}")
             import traceback
             traceback.print_exc()
+            return False
 
     def _on_gallery_context_menu(self, pos, list_widget, source_type):
         item = list_widget.itemAt(pos)
@@ -1366,7 +1377,35 @@ class MainWindow(QMainWindow):
     def _on_smart_grid_changed(self, state):
         self.canvas.set_smart_grid(self.smart_grid_checkbox.isChecked())
 
+    def _check_for_updates(self):
+        if self._update_dialog is not None:
+            return
+        if self._export_thread is not None or (self._slicer_thread and self._slicer_thread.isRunning()):
+            QMessageBox.information(self, "检查更新", "请在当前导出或切图任务结束后更新。")
+            return
+        try:
+            with TemporaryDirectory(prefix="AnomaSlice-update-") as directory:
+                dialog = UpdateDialog(Path(directory), self)
+                self._update_dialog = dialog
+                try:
+                    if dialog.exec() and dialog.download:
+                        self._pending_update = (dialog.download, dialog.release.sha256)
+                        self.close()
+                finally:
+                    self._pending_update = None
+                    self._update_dialog = None
+                    if dialog.worker is not None:
+                        dialog.worker.requestInterruption()
+                        dialog.worker.wait()
+                    dialog.deleteLater()
+        except OSError as error:
+            QMessageBox.warning(self, "更新未完成", str(error))
+
     def closeEvent(self, event):
+        if self._update_dialog is not None and self._pending_update is None:
+            self._update_dialog.reject()
+            event.ignore()
+            return
         if self._export_thread is not None:
             self.statusBar().showMessage("请等待导出完成，或取消导出后关闭窗口。", 5000)
             event.ignore()
@@ -1375,13 +1414,38 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("正在保存切图，请完成后再关闭窗口。", 5000)
             event.ignore()
             return
+        if self._pending_update and self.canvas.has_pending_annotation():
+            QMessageBox.information(self, "更新已暂停", "请先按 Enter 确认正在输入的框，或按 Esc 取消，再更新。")
+            event.ignore()
+            return
         if not self._prepare_image_change():
             event.ignore()
             return
+        if self._pending_update and self.project_manager.masks:
+            choice = QMessageBox.question(self, "更新前保存工程", "要在重启前保存当前切图工程吗？",
+                                          QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                                          QMessageBox.Save)
+            if choice == QMessageBox.Cancel or (choice == QMessageBox.Save and not self._on_save_project()):
+                event.ignore()
+                return
         try:
             self._save_global_config()
         except (OSError, ValueError) as error:
             QMessageBox.warning(self, "全局设置尚未保存", str(error))
+            if self._pending_update:
+                event.ignore()
+                return
+        if self._pending_update:
+            download, digest = self._pending_update
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                launch_update(download, sys.platform, digest)
+            except Exception as error:
+                QMessageBox.warning(self, "无法安装更新", str(error))
+                event.ignore()
+                return
+            finally:
+                QApplication.restoreOverrideCursor()
         self.dataset_recall.stop_scans()
         super().closeEvent(event)
 

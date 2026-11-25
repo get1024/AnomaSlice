@@ -1,7 +1,11 @@
+import errno
 import os
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Barrier
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -66,7 +70,7 @@ class VisualExportTests(unittest.TestCase):
                             for x in range(5, 80) for y in range(4, 20)))
         self.assertEqual(image.pixelColor(40, 36), QColor("black"))
 
-    def test_tiny_indexed_crop_and_png_atomic_replacement(self):
+    def test_tiny_indexed_crop_and_png_encoding_failure(self):
         image = self.original.convertToFormat(QImage.Format_Indexed8)
         boxes = [{"bbox": [8, 8, 1, 1], "label": "自定义", "color": "#123456"}]
         (_, _, crop), = iter_visual_exports(image, boxes, [], crops=True, layers=("gt",))
@@ -80,6 +84,29 @@ class VisualExportTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "裁剪.png"):
                 save_png(QImage(), path)
             self.assertEqual(path.read_bytes(), contents)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_simultaneous_writers_preserve_existing_file_and_publish_distinct_complete_pngs(self):
+        backgrounds = ("blue", "red", "yellow", "white")
+        ready = Barrier(len(backgrounds))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "导出.png"
+            path.write_bytes(b"existing")
+
+            def publish(color):
+                image = QImage(24, 24, QImage.Format_RGB32)
+                image.fill(QColor(color))
+                ready.wait(timeout=5)
+                # Simulate jobs with stale directory listings.
+                return save_png(image, path, occupied=set())
+
+            with ThreadPoolExecutor(max_workers=len(backgrounds)) as pool:
+                outputs = list(pool.map(publish, backgrounds))
+            self.assertEqual(set(outputs), {path.with_name(f"导出 ({i}).png") for i in range(2, 6)})
+            self.assertEqual(set(path.parent.iterdir()), {path, *outputs})
+            self.assertEqual(path.read_bytes(), b"existing")
+            for output, background in zip(outputs, backgrounds):
+                self.assertEqual(QImage(str(output)).pixelColor(23, 23), QColor(background))
 
     def test_crop_region_can_come_from_hidden_layer(self):
         outer = [{"bbox": [20, 30, 110, 90], "label": "划痕"}]
@@ -96,6 +123,41 @@ class VisualExportTests(unittest.TestCase):
                 self.assertEqual(crop.pixelColor(0, 40), QColor("black"))
                 edge = {crop.pixelColor(x, 30).name() for x in range(17, 69)}
                 self.assertIn(color, edge)
+
+    def test_volume_without_exclusive_rename_or_links_preserves_files_and_cleans_failed_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "图.png"
+            path.write_bytes(b"existing")
+            with patch("visual_export.sys.platform", "darwin"), \
+                 patch("visual_export._macos_rename_exclusive", side_effect=OSError(errno.ENOTSUP, "rename")), \
+                 patch("visual_export.os.link", side_effect=OSError(errno.ENOTSUP, "link")):
+                new = save_png(self.original, path, occupied=set())
+                self.assertEqual(new, path.with_name("图 (2).png"))
+                self.assertEqual(QImage(str(new)).pixelColor(3, 6), QColor("yellow"))
+
+                def disk_full(source, output):
+                    output.write(source.read(8))
+                    raise OSError(errno.ENOSPC, "disk full")
+
+                with patch("visual_export.shutil.copyfileobj", side_effect=disk_full):
+                    with self.assertRaises(OSError) as error:
+                        save_png(self.original, path)
+                self.assertEqual(error.exception.errno, errno.ENOSPC)
+                self.assertEqual(set(path.parent.iterdir()), {path, new})
+                self.assertEqual(path.read_bytes(), b"existing")
+
+    def test_rename_permission_and_space_errors_do_not_attempt_a_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "图.png"
+            for err in (errno.EACCES, errno.ENOSPC):
+                with self.subTest(err=err), patch("visual_export.sys.platform", "darwin"), \
+                     patch("visual_export._macos_rename_exclusive", side_effect=OSError(err, "failed")), \
+                     patch("visual_export.os.link") as link:
+                    with self.assertRaises(OSError) as error:
+                        save_png(self.original, path)
+                    self.assertEqual(error.exception.errno, err)
+                    link.assert_not_called()
+                    self.assertEqual(list(path.parent.iterdir()), [])
 
     def test_no_boxes_and_empty_selection(self):
         (_, _, full), = iter_visual_exports(self.original, [], [], crops=False, layers=("gt",))

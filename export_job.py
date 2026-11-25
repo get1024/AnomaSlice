@@ -1,15 +1,13 @@
 """Export a snapshot of the open dataset without navigating or saving annotations."""
 
 import re
-from datetime import datetime
 from pathlib import Path
-from tempfile import mkdtemp
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
 from visual_export import iter_visual_exports, save_png
-from xml_annotations import EXPORT_MARKER, AnnotationXml, ImageEntry
+from xml_annotations import AnnotationXml, ImageEntry
 
 
 def _filename_part(text):
@@ -78,15 +76,14 @@ class ExportJob(QThread):
                 label = _filename_part(boxes[layer][i]["label"])
                 source = "GT" if layer == "gt" else "Pred"
                 suffix = f"_{source}-{i + 1}_{label}"
-            if self.directory is None:
-                prefix = datetime.now().strftime("AnomaSlice-%Y%m%d-%H%M%S-")
-                self.directory = Path(mkdtemp(prefix=prefix, dir=self.options.directory))
-                (self.directory / EXPORT_MARKER).touch()
-            save_png(rendered, self.directory / f"{base}{suffix}.png")
+            destination = self.options.directory / f"{base}{suffix}.png"
+            save_png(rendered, destination, occupied=self.occupied_names)
+            self.directory = destination.parent
             self.written += 1
 
     def run(self):
         try:
+            self.occupied_names = {p.name.casefold() for p in self.options.directory.iterdir()}
             for completed, (number, path) in enumerate(self.images, start=1):
                 if self.isInterruptionRequested():
                     break

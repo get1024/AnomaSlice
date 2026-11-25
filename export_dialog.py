@@ -75,7 +75,7 @@ class ExportDialog(QDialog):
 
         destination = QHBoxLayout()
         self.folder = QLineEdit()
-        self.folder.setPlaceholderText("每次导出会在此目录下新建子目录")
+        self.folder.setPlaceholderText("PNG 直接保存到此目录，同名文件自动编号")
         destination.addWidget(self.folder)
         browse = QPushButton("选择文件夹…")
         browse.clicked.connect(self._browse)

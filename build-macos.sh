@@ -23,6 +23,7 @@ mkdir -p "$build_dir" "$dist_dir"
     --clean --noconfirm --windowed --onedir \
     --name AnomaSlice --target-arch "$arch" \
     --osx-bundle-identifier io.github.get1024.anomaslice \
+    --add-data "$project_dir/VERSION:." \
     --specpath "$build_dir" --workpath "$build_dir/work" --distpath "$build_dir/dist" \
     "$project_dir/main.py"
 

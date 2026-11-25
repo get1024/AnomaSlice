@@ -68,11 +68,10 @@ class ExportWorkflowTests(unittest.TestCase):
         while self.window._export_thread is not None and time.monotonic() < deadline:
             QTest.qWait(10)
         self.assertIsNone(self.window._export_thread, "Export worker did not finish")
-        runs = set(self.output.iterdir()) - previous
-        self.assertEqual(len(runs), 1)
-        run, = runs
-        self.assertTrue(run.is_dir() and run.name.startswith("AnomaSlice-"))
-        return sorted(run.rglob("*.png"))
+        created = set(self.output.iterdir()) - previous
+        for file in created:
+            self.assertTrue(file.is_file() and file.suffix == ".png", str(file))
+        return sorted(created)
 
     def test_current_view_and_selected_crop_use_unsaved_gt_without_writing_sources(self):
         image = self.image("当前.png")
@@ -132,8 +131,39 @@ class ExportWorkflowTests(unittest.TestCase):
         exported, = self.export("current_image")
         self.window._open_source(self.images)
         self.assertEqual(self.window._image_list, [str(source)])
-        self.window._open_source(exported.parent)
+        self.window._open_source(self.images, selected=exported)
         self.assertEqual(self.window._image_list, [str(exported)])
+        self.assertEqual(self.window._current_image_path, str(exported))
+
+    def test_flat_export_preserves_source_with_conflicting_name_and_accepts_exports_folder(self):
+        original = self.image("a/sample.png", "blue")
+        conflict = self.image("b/000001_SAMPLE.PNG", "red")
+        self.output = conflict.parent
+        before = conflict.read_bytes()
+        self.window._open_source(self.images)
+        self.assertEqual(self.window._current_image_path, str(original))
+        result, = self.export("current_image")
+        self.assertEqual(result.name, "000001_sample (2).png")
+        self.assertEqual(QImage(str(result)).pixelColor(0, 0), QColor("blue"))
+        self.assertEqual(before, conflict.read_bytes())
+        self.window._open_source(self.images)
+        self.assertCountEqual(self.window._image_list, [str(original), str(conflict)])
+
+        exports_only = self.root / "只含导出图"
+        exports_only.mkdir()
+        copied = exports_only / result.name
+        copied.write_bytes(result.read_bytes())
+        self.window._open_source(exports_only)
+        self.assertEqual(self.window._image_list, [str(copied)])
+
+    def test_previous_marked_directory_stays_excluded_until_opened_directly(self):
+        source = self.image("原图.png")
+        old = self.image("AnomaSlice-旧版/000001_原图.png")
+        (old.parent / ".anomaslice-export").touch()
+        self.window._open_source(self.images)
+        self.assertEqual(self.window._image_list, [str(source)])
+        self.window._open_source(old.parent)
+        self.assertEqual(self.window._image_list, [str(old)])
 
     def test_all_and_class_crops_include_unvisited_images_and_allow_missing_predictions(self):
         first = self.image("图1.png")

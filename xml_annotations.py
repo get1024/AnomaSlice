@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from xml.dom import Node, minidom
 from xml.parsers.expat import ExpatError
 
@@ -16,6 +17,10 @@ from annotation_store import AnnotationStore
 
 
 EXPORT_MARKER = ".anomaslice-export"
+EXPORT_PNG_KEY = "AnomaSlice-Export"
+# On Windows a Python reader can deny an atomic rename while it holds the
+# source file open. Release this lock before parsing or rendering any boxes.
+_xml_io_lock = Lock()
 _EMPTY = b"""<?xml version="1.0" encoding="utf-8"?>
 <DefectDetection>
   <RawCount>0</RawCount>
@@ -49,7 +54,8 @@ class ImageEntry:
         image = Path(path).resolve()
         if image not in entries:
             # Older projects store paths only. Index the directory once on demand.
-            entries.update((entry.image, entry) for entry in scan_folder(image.parent, recursive=False))
+            entries.update((entry.image, entry) for entry in scan_folder(image.parent, recursive=False,
+                                                                         selected=image))
         if image not in entries:
             raise ValueError("图片已移动，请重新打开文件夹。")
         return entries[image]
@@ -72,10 +78,11 @@ class ImageEntry:
         return next(iter(matches), nested)
 
 
-def scan_folder(root, *, recursive=True):
+def scan_folder(root, *, recursive=True, selected=None):
     root = Path(root).resolve(strict=True)
     formats = image_extensions()
     images = defaultdict(list)
+    exports = defaultdict(list)
     xmls = defaultdict(list)
 
     def report_error(error):
@@ -88,13 +95,28 @@ def scan_folder(root, *, recursive=True):
         if not recursive:
             subdirs[:] = [d for d in subdirs if directory == root and d.casefold() == "xml"]
         for name in names:
+            if name.startswith(".anomaslice-write-") and name.endswith(".tmp"):
+                continue
             path = directory / name
             ext = path.suffix[1:].lower()
             if ext == "xml":
                 xmls[path.stem.casefold()].append(path)
             elif (recursive or directory == root) and (ext in formats or QImageReader.imageFormat(str(path))):
-                images[path.stem.casefold()].append(path)
+                # Only output-shaped filenames need a PNG header check. Real
+                # dataset images may also start with a numeric camera index.
+                generated = (ext == "png" and re.match(r"\d{6,}_", name)
+                             and QImageReader(str(path)).text(EXPORT_PNG_KEY) == "1")
+                group = exports if generated else images
+                group[path.stem.casefold()].append(path)
 
+    if not images:
+        images = exports
+    elif selected is not None:
+        selected = Path(selected).resolve()
+        matching_exports = exports.get(selected.stem.casefold(), ())
+        if selected in matching_exports or (selected.suffix.casefold() == ".xml" and matching_exports
+                                            and selected.stem.casefold() not in images):
+            images = exports
     entries = []
     for stem, group in images.items():
         candidates = xmls.get(stem, [])
@@ -197,7 +219,8 @@ class AnnotationXml:
     @classmethod
     def open_path(cls, path, *, must_exist=False):
         try:
-            source = path.read_bytes()
+            with _xml_io_lock:
+                source = path.read_bytes()
         except FileNotFoundError:
             if must_exist:
                 raise
@@ -284,8 +307,9 @@ class AnnotationXml:
             if current != self._source:
                 output.cancelWriting()
                 raise ValueError("XML 已被其他程序修改。请重新打开图片后再审核。")
-            if not output.commit():
-                raise OSError(output.errorString())
+            with _xml_io_lock:
+                if not output.commit():
+                    raise OSError(output.errorString())
         finally:
             lock.unlock()
         self._source = encoded
