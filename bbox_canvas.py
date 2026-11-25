@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import math
+import sys
 
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QKeySequence, QPen
@@ -22,7 +23,7 @@ class _BoxLabel(QGraphicsItem):
     def __init__(self, text, color, box, fit_scale, image_height, prediction):
         super().__init__()
         self._text = text
-        self._font = QFont("Microsoft YaHei UI", 9)
+        self._font = QFont("PingFang SC" if sys.platform == "darwin" else "Microsoft YaHei UI", 9)
         metrics = QFontMetricsF(self._font)
         height = metrics.height() + 4
         row = height + 2
@@ -59,8 +60,7 @@ class BoxCanvasMixin:
     """Add bbox interaction without changing the existing grid/mask workflow.
 
     ``annotations_changed`` receives a deep-copied list after committed edits.
-    ``resolve_label`` is called once with the complete trimmed editor value.
-    ``new_label_committed`` receives the resulting canonical label.
+    ``resolve_label`` maps new or edited text to its canonical label.
     """
 
     def __init__(self, *args, **kwargs):
@@ -82,7 +82,6 @@ class BoxCanvasMixin:
         self.resolve_label = lambda text: text
         self.annotations_changed = lambda annotations: None
         self.selection_changed = lambda index: None
-        self.new_label_committed = lambda label: None
         super().__init__(*args, **kwargs)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
@@ -372,8 +371,12 @@ class BoxCanvasMixin:
         if not value:
             self._label_editor.setFocus()
             return False
+        original_label = None
+        if self._rename_index is not None:
+            original_label = self._annotations[self._rename_index]["label"]
         try:
-            label = self.resolve_label(value)
+            # Preserve imported text even if it is now configured as an alias.
+            label = value if value == original_label else self.resolve_label(value)
             if not isinstance(label, str) or not label.strip():
                 raise ValueError("标签不能为空")
             label = label.strip()
@@ -383,6 +386,10 @@ class BoxCanvasMixin:
             self._label_editor.setFocus()
             self._label_editor.selectAll()
             return False
+        if label == original_label:
+            self.cancel_pending_annotation()
+            self.setFocus(Qt.OtherFocusReason)
+            return True
         self._push_annotation_undo()
         if self._rename_index is not None:
             self._annotations[self._rename_index]["label"] = label
@@ -397,7 +404,6 @@ class BoxCanvasMixin:
         self.cancel_pending_annotation()
         self._selected_annotation = selected
         self._render_annotations()
-        self.new_label_committed(label)
         self.annotations_changed(self.get_annotations())
         self.setFocus(Qt.OtherFocusReason)
         return True

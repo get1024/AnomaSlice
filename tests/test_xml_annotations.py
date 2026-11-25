@@ -31,6 +31,8 @@ class AnnotationXmlTests(unittest.TestCase):
         paired = [e for e in entries if e.xml]
         self.assertEqual([e.image.parent.name for e in paired], ["相机2", "相机10"])
         self.assertTrue(all(e.xml.parent.parent == e.image.parent for e in paired))
+        for entry in paired:
+            self.assertEqual(str(entry.target()), str(entry.xml))
         collision = paired[0].image.with_suffix(".jpg")
         self.assertTrue(image.save(str(collision)))
         ambiguous = [e for e in scan_folder(self.root) if e.image.parent == collision.parent]

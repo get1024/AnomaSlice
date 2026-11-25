@@ -17,15 +17,15 @@ class LabelDialog(QDialog):
         self.resize(520, 360)
         self.catalog = catalog
         layout = QVBoxLayout(self)
-        hint = QLabel("每行一种缺陷；多个别名用逗号分隔。\n仅完整输入匹配别名：1 → 划痕，待定1 保持原样。")
+        hint = QLabel("类别表适用于所有图片。每行填写一种缺陷，多个别名用逗号分隔。\n"
+                      "标注时输入完整别名即可使用对应的类别，区分大小写。")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["缺陷种类", "别名（可留空）"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        for record in catalog.to_list():
-            self._add_row(record["name"], ", ".join(record["aliases"]))
+        self._populate_table(catalog)
         layout.addWidget(self.table)
         row = QHBoxLayout()
         add = QPushButton("添加种类")
@@ -35,6 +35,10 @@ class LabelDialog(QDialog):
         row.addWidget(add)
         row.addWidget(remove)
         row.addStretch()
+        restore = QPushButton("恢复默认四类")
+        restore.setToolTip("用模型默认的四种缺陷及其别名替换表格内容，点击保存后生效。")
+        restore.clicked.connect(lambda: self._populate_table(LabelCatalog.defaults()))
+        row.addWidget(restore)
         layout.addLayout(row)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("保存")
@@ -42,6 +46,12 @@ class LabelDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _populate_table(self, catalog):
+        self.table.setRowCount(0)
+        for record in catalog.to_list():
+            self._add_row(record["name"], ", ".join(record["aliases"]))
+        self.table.clearSelection()
 
     def _add_row(self, name="", aliases=""):
         row = self.table.rowCount()
@@ -55,6 +65,10 @@ class LabelDialog(QDialog):
             self.table.removeRow(row)
 
     def accept(self):
+        # The Save button can run before the delegate receives focus-out.
+        editor = self.table.indexWidget(self.table.currentIndex())
+        if editor is not None and self.table.state() == QAbstractItemView.EditingState:
+            self.table.commitData(editor)
         records = []
         for row in range(self.table.rowCount()):
             name_item, aliases_item = self.table.item(row, 0), self.table.item(row, 1)

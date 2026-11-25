@@ -3,10 +3,11 @@
 import os
 import shutil
 import json
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import QRectF, QSignalBlocker, Qt, QTimer
-from PySide6.QtGui import QAction, QIcon, QImage, QPixmap
+from PySide6.QtGui import QAction, QIcon, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QListWidget,
     QListWidgetItem, QLabel, QLineEdit, QMainWindow, QPushButton, QCheckBox,
@@ -22,7 +23,7 @@ from comparison_paths import ComparisonSources
 from dataset_recall_label import DatasetRecallLabel
 from image_canvas import ScalableImageLabel, SliceCanvas
 from label_dialog import LabelDialog
-from project_store import ProjectManager
+from project_store import ProjectManager, json_write_lock, write_json_atomic
 from slicer import SlicerThread
 from xml_annotations import AnnotationXml, ImageEntry, scan_folder
 
@@ -37,7 +38,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AnomaSlice — 图片标注与切图")
         self.resize(1400, 900)
         self.project_manager = ProjectManager()
-        self.label_catalog = LabelCatalog([])
+        self._global_catalog = LabelCatalog.defaults()
+        self.label_catalog = self._global_catalog
         self.annotation_store = AnnotationStore()
         self._boxes_dirty = False
         self._annotation_load_error = False
@@ -56,12 +58,11 @@ class MainWindow(QMainWindow):
         self._current_patch_index = 0
         self._create_actions()
         self._build_ui()
-        self.canvas.resolve_label = self.label_catalog.resolve
         self.canvas.annotations_changed = self._on_annotations_changed
         self.canvas.selection_changed = self._sync_review_selection
-        self.canvas.new_label_committed = self._on_label_committed
         self._clear_annotation_state()
         self._load_global_config()
+        self._set_catalog(self._global_catalog)
         self._set_mode(0)
 
 
@@ -187,7 +188,9 @@ class MainWindow(QMainWindow):
         title = QLabel("人工框选标注")
         title.setStyleSheet("font-weight: bold; font-size: 18px;")
         layout.addWidget(title)
-        open_button = QPushButton("打开数据集…  (Ctrl+I)")
+        native_text = QKeySequence.SequenceFormat.NativeText
+        open_key = self.open_dataset_action.shortcut().toString(native_text)
+        open_button = QPushButton(f"打开数据集…  ({open_key})")
         open_button.clicked.connect(self.open_dataset_action.trigger)
         layout.addWidget(open_button)
         self.annotation_image_label = QLabel("尚未打开图片")
@@ -203,6 +206,7 @@ class MainWindow(QMainWindow):
         self.classes_button.clicked.connect(self._edit_labels)
         layout.addWidget(self.classes_button)
         self.catalog_label = QLabel("可直接输入标签，也可先设置种类别名。")
+        self.catalog_label.setTextFormat(Qt.PlainText)
         self.catalog_label.setWordWrap(True)
         layout.addWidget(self.catalog_label)
         self.box_count_label = QLabel("标注框：0")
@@ -212,7 +216,8 @@ class MainWindow(QMainWindow):
         self.review_box_list.setMaximumHeight(180)
         self.review_box_list.currentRowChanged.connect(self.canvas.select_annotation)
         delete_from_list = QAction(self.review_box_list)
-        delete_from_list.setShortcut("Delete")
+        delete_keys = ["Backspace", "Delete"] if sys.platform == "darwin" else ["Delete"]
+        delete_from_list.setShortcuts([QKeySequence(key) for key in delete_keys])
         delete_from_list.setShortcutContext(Qt.WidgetShortcut)
         delete_from_list.triggered.connect(self.canvas.delete_selected_annotation)
         self.review_box_list.addAction(delete_from_list)
@@ -227,7 +232,8 @@ class MainWindow(QMainWindow):
         fit = QPushButton("适应窗口")
         fit.clicked.connect(self.canvas.fit_image)
         layout.addWidget(fit)
-        self.delete_box_button = QPushButton("删除所选框  (Delete)")
+        delete_key = delete_from_list.shortcut().toString(native_text) if sys.platform == "darwin" else "Delete"
+        self.delete_box_button = QPushButton(f"删除所选框  ({delete_key})")
         self.delete_box_button.clicked.connect(self.canvas.delete_selected_annotation)
         layout.addWidget(self.delete_box_button)
         undo_row = QHBoxLayout()
@@ -238,11 +244,17 @@ class MainWindow(QMainWindow):
         undo_row.addWidget(undo)
         undo_row.addWidget(redo)
         layout.addLayout(undo_row)
-        self.save_xml_button = QPushButton("保存 GT XML  (Ctrl+S)")
+        save_key = self.save_project_action.shortcut().toString(native_text)
+        self.save_xml_button = QPushButton(f"保存 GT XML  ({save_key})")
         self.save_xml_button.clicked.connect(self._on_save_current)
         layout.addWidget(self.save_xml_button)
         layout.addStretch()
-        self.annotation_help = QLabel("左键拖动画框，Enter 确认标签。\n单击选框，双击改标签，Delete 删除。\n滚轮缩放，右键拖动平移。\nCtrl+Z 撤回，Ctrl+Shift+Z 重做。")
+        undo_key = self.undo_action.shortcut().toString(native_text)
+        redo_key = self.redo_action.shortcut().toString(native_text)
+        self.annotation_help = QLabel(
+            f"左键拖动画框，Enter 确认标签。\n单击选框，双击改标签，{delete_key} 删除。\n"
+            f"滚轮缩放，右键拖动平移。\n{undo_key} 撤回，{redo_key} 重做。"
+        )
         self.annotation_help.setWordWrap(True)
         layout.addWidget(self.annotation_help)
         navigation = QHBoxLayout()
@@ -307,7 +319,8 @@ class MainWindow(QMainWindow):
         else:
             self._on_save_project()
 
-    def _refresh_catalog(self):
+    def _set_catalog(self, catalog):
+        self.label_catalog = catalog
         self.canvas.resolve_label = self.label_catalog.resolve
         descriptions = []
         for record in self.label_catalog.to_list():
@@ -317,15 +330,21 @@ class MainWindow(QMainWindow):
 
     def _edit_labels(self):
         dialog = LabelDialog(self.label_catalog, self)
-        if dialog.exec():
-            self.label_catalog = dialog.catalog
-            self._refresh_catalog()
-            self._save_global_config()
-
-    def _on_label_committed(self, label):
-        self.label_catalog.add_label(label)
-        self._refresh_catalog()
-        self._save_global_config()
+        project = self.project_manager.project_path
+        dialog.setWindowTitle("缺陷种类与别名 · " + (Path(project).name if project else "全局设置"))
+        while dialog.exec():
+            try:
+                if project:
+                    self.project_manager.save_label_catalog(dialog.catalog)
+                else:
+                    self._save_global_config(dialog.catalog)
+                    self._global_catalog = dialog.catalog
+            except (OSError, ValueError) as error:
+                QMessageBox.warning(self, "类别表尚未保存", str(error))
+                continue
+            self._set_catalog(dialog.catalog)
+            break
+        dialog.deleteLater()
 
     def _on_annotations_changed(self, boxes):
         if self._xml_document is None:
@@ -415,25 +434,18 @@ class MainWindow(QMainWindow):
             else:
                 doc = AnnotationXml.open(entry)
             if not doc.exists and not self._comparison:
-                legacy = self.annotation_store.load(path, width, height)
+                legacy = self.annotation_store.load(path, width, height, include_catalog=False)
                 if os.path.isfile(self.annotation_store.sidecar_path(path)):
                     doc.boxes = legacy["boxes"]
                 else:
                     doc.boxes = self.annotation_store.validate_boxes(
                         self.project_manager.annotations.get(path, []), width, height
                     )
-                self._merge_legacy_labels(legacy.get("label_catalog", []))
-            for box in doc.boxes:
-                try:
-                    self.label_catalog.add_label(box["label"])
-                except ValueError:
-                    pass  # Preserve existing label text even when it is now an alias.
             self._xml_document = doc
             self.canvas.set_annotations(doc.boxes)
             self._show_boxes(doc.boxes)
             self.annotation_save_label.setText(self._xml_status())
             self.annotation_save_label.setToolTip(str(doc.path))
-            self._refresh_catalog()
         except (OSError, ValueError) as error:
             self._annotation_load_error = True
             if self._comparison:
@@ -441,23 +453,6 @@ class MainWindow(QMainWindow):
             self.canvas.setEnabled(False)
             self.annotation_save_label.setText(f"无法编辑标注：{error}")
             self.annotation_save_label.setToolTip(str(error))
-
-    def _merge_legacy_labels(self, records):
-        for record in records:
-            try:
-                self.label_catalog.add_label(record["name"])
-            except ValueError:
-                self.statusBar().showMessage("旧标注中的类别与现有别名冲突，已保留现有设置。", 7000)
-                continue
-            for alias in record["aliases"]:
-                merged = self.label_catalog.to_list()
-                target = next(r for r in merged if r["name"] == record["name"])
-                if alias not in target["aliases"]:
-                    target["aliases"].append(alias)
-                    try:
-                        self.label_catalog = LabelCatalog(merged)
-                    except ValueError:
-                        self.statusBar().showMessage("旧标注中的别名冲突，已保留现有设置。", 7000)
 
     def _build_patch_viewer(self):
         container = QWidget()
@@ -960,6 +955,7 @@ class MainWindow(QMainWindow):
             self.mode_combo.setCurrentIndex(0)
         self._comparison = comparison
         self._dataset_source = source
+        self._set_catalog(self._global_catalog)
         self._image_entries = {entry.image: entry for entry in entries}
         self._image_list = [str(path) for path in paths]
         self._start_dataset_metrics()
@@ -1112,6 +1108,7 @@ class MainWindow(QMainWindow):
             "normal_dir": self.normal_path_label.text(),
             "abnormal_dir": self.abnormal_path_label.text(),
             "label_catalog": self.label_catalog.to_list(),
+            "label_catalog_version": 1,
             "mode": self.mode_combo.currentIndex(),
         }
 
@@ -1128,9 +1125,6 @@ class MainWindow(QMainWindow):
         if "abnormal_dir" in config:
             self.abnormal_path_label.setText(config["abnormal_dir"])
             self.project_manager.abnormal_dir = config["abnormal_dir"]
-        if "label_catalog" in config:
-            self.label_catalog = LabelCatalog(config["label_catalog"])
-            self._refresh_catalog()
         self.mode_combo.setCurrentIndex(config.get("mode", 0))
 
     def _on_new_project(self):
@@ -1141,6 +1135,7 @@ class MainWindow(QMainWindow):
         self._image_entries = {}
         self._start_dataset_metrics()
         self.project_manager = ProjectManager()
+        self._set_catalog(self._global_catalog)
         self._image_list = []
         self._image_index = -1
         self._current_image_path = None
@@ -1181,6 +1176,7 @@ class MainWindow(QMainWindow):
             self.annotation_image_label.setText(os.path.basename(path))
             self.annotation_image_label.setToolTip(path)
             self.image_position_label.setText("工程中没有可显示的图片")
+            self._set_catalog(self._catalog_from_config(config))
             self._apply_config(config)
 
             self._image_list = self.project_manager.images
@@ -1322,24 +1318,52 @@ class MainWindow(QMainWindow):
         if not self._prepare_image_change():
             event.ignore()
             return
-        self._save_global_config()
+        try:
+            self._save_global_config()
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "全局设置尚未保存", str(error))
         self.dataset_recall.stop_scans()
         super().closeEvent(event)
 
     def _get_global_config_path(self):
         return os.path.join(os.path.expanduser("~"), ".image_cutting_config.json")
 
-    def _save_global_config(self):
-        config = {
-            **self._get_current_config(),
-            "smart_grid": self.smart_grid_checkbox.isChecked(),
-            "mask_opacity": self.mask_opacity_slider.value()
-        }
-        try:
-            with open(self._get_global_config_path(), 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=4)
-        except Exception as e:
-            print(f"Error saving global config: {e}")
+    def _catalog_from_config(self, config):
+        if "label_catalog_version" in config:
+            version = config["label_catalog_version"]
+            if type(version) is not int or version != 1:
+                raise ValueError(f"不支持的类别表版本：{version}")
+        if "label_catalog" not in config:
+            return self._global_catalog
+        if "label_catalog_version" not in config:
+            return LabelCatalog.from_legacy(config["label_catalog"])
+        return LabelCatalog(config["label_catalog"])
+
+    def _save_global_config(self, edited_catalog=None):
+        path = self._get_global_config_path()
+        with json_write_lock(path):
+            try:
+                with open(path, encoding="utf-8") as stream:
+                    stored = json.load(stream)
+            except FileNotFoundError:
+                stored = {}
+            if not isinstance(stored, dict):
+                raise ValueError("全局设置必须是 JSON 对象。")
+            # A project or an older window can close after a different window
+            # saves its aliases. Only the editor can replace the disk catalog.
+            catalog = self._catalog_from_config(stored)
+            if edited_catalog is not None:
+                if catalog.to_list() != self._global_catalog.to_list():
+                    raise ValueError("全局类别表已被其他窗口修改，请重新启动应用后再编辑。")
+                catalog = edited_catalog
+            config = {
+                **stored,
+                **self._get_current_config(),
+                "label_catalog": catalog.to_list(),
+                "smart_grid": self.smart_grid_checkbox.isChecked(),
+                "mask_opacity": self.mask_opacity_slider.value()
+            }
+            write_json_atomic(path, config)
 
     def _load_global_config(self):
         path = self._get_global_config_path()
@@ -1348,6 +1372,7 @@ class MainWindow(QMainWindow):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
+            self._global_catalog = self._catalog_from_config(config)
             self._apply_config({k: v for k, v in config.items() if k != "mode"})
 
             self.patch_width_spin.setValue(config.get("patch_width", 256))

@@ -10,13 +10,14 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit, QMessageBox
 
 from annotation_store import LabelCatalog
 from app_window import MainWindow
+from label_dialog import LabelDialog
 from slicer import SlicerThread, count_mask_pixels
 
 
@@ -69,9 +70,13 @@ class AppWorkflowTests(unittest.TestCase):
     def xml_path(self, index=0):
         return self.root / "xml" / (Path(self.images[index]).stem + ".xml")
 
+    def edit_catalog(self, records):
+        with patch("app_window.LabelDialog") as dialog:
+            dialog.return_value.catalog = LabelCatalog(records)
+            dialog.return_value.exec.side_effect = [True, False]
+            self.window._edit_labels()
+
     def test_enter_alias_save_xml_undo_redo_navigation_and_reopen(self):
-        self.window.label_catalog = LabelCatalog([{"name": "划痕", "aliases": ["1"]}])
-        self.window._refresh_catalog()
         self.commit("1")
         self.assertFalse(self.xml_path().exists())
         QTest.keyClick(self.window.canvas, Qt.Key_S, Qt.ControlModifier)
@@ -130,13 +135,104 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertTrue(self.window.canvas.isEnabled())
 
     def test_existing_text_is_not_converted_by_new_aliases(self):
+        self.edit_catalog([])
         self.commit("1")
-        self.window.label_catalog = LabelCatalog([{"name": "划痕", "aliases": ["1"]}])
-        self.window._refresh_catalog()
+        self.edit_catalog([{"name": "划痕", "aliases": ["1"]}])
         self.window._on_next_image()
         self.window._on_prev_image()
         self.assertFalse(self.window._annotation_load_error)
         self.assertEqual(self.window.canvas.get_annotations()[0]["label"], "1")
+
+    def test_browsing_xml_and_legacy_sidecar_cannot_change_the_catalog(self):
+        defaults = LabelCatalog.defaults().to_list()
+        self.assertEqual(self.window.label_catalog.to_list(), defaults)
+        self.commit("仅本图")
+        self.commit("scratch")
+        self.window._on_save_current()
+        xml = self.xml_path().read_bytes()
+        self.window.annotation_store.save(
+            self.images[1], 320, 240, [{"bbox": [1, 1, 2, 2], "label": "1"}],
+            [{"name": "旧目录", "aliases": ["scratch"]}],
+        )
+        self.window._on_next_image()
+        self.assertEqual(self.window.canvas.get_annotations()[0]["label"], "1")
+        self.assertEqual(self.window.label_catalog.to_list(), defaults)
+        self.edit_catalog([])
+        self.window._on_prev_image()
+        self.assertEqual(self.window.label_catalog.to_list(), [])
+        self.assertEqual([box["label"] for box in self.window.canvas.get_annotations()], ["仅本图", "划痕"])
+        self.assertEqual(self.xml_path().read_bytes(), xml)
+        self.window._on_next_image()
+        self.assertEqual(self.window.canvas.resolve_label("scratch"), "scratch")
+        reopened = MainWindow()
+        try:
+            self.assertEqual(reopened.label_catalog.to_list(), [])
+        finally:
+            reopened.close()
+
+    def test_project_catalog_saves_to_project_and_plain_images_return_to_global(self):
+        personal = [{"name": "个人分类", "aliases": ["1"]}]
+        project_labels = [{"name": "工程分类", "aliases": ["1"]}]
+        self.edit_catalog(personal)
+        path = self.root / "project.json"
+        path.write_text(json.dumps({
+            "version": "1.1", "images": self.images, "current_index": 0,
+            "config": {"label_catalog_version": 1, "label_catalog": project_labels},
+            "annotations": {self.images[0]: [{"label": "历史标签", "bbox": [1, 1, 5, 5]}]},
+        }), encoding="utf-8")
+        with patch("app_window.QFileDialog.getOpenFileName", return_value=(str(path), "")):
+            self.window._on_open_project()
+        self.assertEqual(self.window.canvas.get_annotations()[0]["label"], "历史标签")
+        self.assertEqual(self.window.label_catalog.to_list(), project_labels)
+        self.edit_catalog([])
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["config"]["label_catalog"], [])
+        self.window._save_global_config()
+        settings = self.root / "settings.json"
+        self.assertEqual(json.loads(settings.read_text(encoding="utf-8"))["label_catalog"], personal)
+        self.window._open_source(self.root, Path(self.images[1]))
+        self.assertEqual(self.window.label_catalog.to_list(), personal)
+        self.assertEqual(self.window.canvas.get_annotations(), [])
+
+    def test_migrating_old_settings_keeps_shortcuts_and_later_deletions(self):
+        path = self.root / "settings.json"
+        path.write_text(json.dumps({"label_catalog": [
+            {"name": "脱落", "aliases": ["2"]}, {"name": "污渍", "aliases": ["3"]},
+        ]}), encoding="utf-8")
+        migrated = MainWindow()
+        try:
+            for alias, name in (("2", "脱落"), ("3", "污渍"), ("0", "掉漆"),
+                                ("scratch", "划痕"), ("other", "其他")):
+                self.assertEqual(migrated.canvas.resolve_label(alias), name)
+            with patch("app_window.LabelDialog") as dialog:
+                dialog.return_value.exec.side_effect = [True, False]
+                dialog.return_value.catalog = LabelCatalog([])
+                migrated._edit_labels()
+        finally:
+            migrated.close()
+        # The original window predates the edit in the second window.
+        with self.assertRaisesRegex(ValueError, "其他窗口"):
+            self.window._save_global_config(LabelCatalog.defaults())
+        self.window._save_global_config()
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual((saved["label_catalog_version"], saved["label_catalog"]), (1, []))
+
+    def test_save_button_commits_the_active_cell_and_releases_dialog(self):
+        def edit_active_cell():
+            dialog = self.app.activeModalWidget()
+            cell = dialog.table.item(0, 1)
+            dialog.table.setCurrentItem(cell)
+            dialog.table.editItem(cell)
+            editor = dialog.table.findChild(QLineEdit)
+            editor.selectAll()
+            QTest.keyClicks(editor, "0, drop_paint, peel")
+            buttons = dialog.findChild(QDialogButtonBox)
+            QTest.mouseClick(buttons.button(QDialogButtonBox.Ok), Qt.LeftButton)
+
+        QTimer.singleShot(0, edit_active_cell)
+        self.window.classes_button.click()
+        self.assertEqual(self.window.canvas.resolve_label("peel"), "掉漆")
+        self.app.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.assertEqual(self.window.findChildren(LabelDialog), [])
 
     def test_empty_project_cannot_overwrite_previous_image(self):
         self.commit("划痕")

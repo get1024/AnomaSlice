@@ -14,6 +14,15 @@ import tempfile
 from collections.abc import Mapping
 
 
+# IDs and model labels from the GeSi Defect module, in model output order.
+_DEFAULT_LABELS = (
+    ("掉漆", "0", "drop_paint"),
+    ("划痕", "1", "scratch"),
+    ("污渍", "2", "stain"),
+    ("其他", "3", "other"),
+)
+
+
 class AnnotationValidationError(ValueError):
     """A label catalog or annotation document is invalid or incompatible."""
 
@@ -42,6 +51,26 @@ class LabelCatalog:
     ``resolve(' 1 ')`` can return ``'划痕'`` while ``resolve('待定1')`` returns
     ``'待定1'``. Unknown nonempty text is accepted without changing the catalog.
     """
+
+    @classmethod
+    def defaults(cls):
+        """Create an independent catalog for a new installation."""
+        return cls([{"name": name, "aliases": [class_id, model_label]}
+                    for name, class_id, model_label in _DEFAULT_LABELS])
+
+    @classmethod
+    def from_legacy(cls, records):
+        """Fill missing defaults while preserving every existing token's meaning."""
+        catalog = cls(records)
+        by_name = {record["name"]: record for record in catalog.to_list()}
+        occupied = catalog._names.union(catalog._aliases)
+        for name, class_id, model_label in _DEFAULT_LABELS:
+            if name in catalog._aliases:
+                continue
+            record = by_name.setdefault(name, {"name": name, "aliases": []})
+            record["aliases"].extend(alias for alias in (class_id, model_label)
+                                     if alias not in occupied)
+        return cls(list(by_name.values()))
 
     def __init__(self, records=None):
         if records is None:
@@ -158,8 +187,8 @@ class AnnotationStore:
             "label_catalog": [],
         }
 
-    def load(self, image_path, width, height):
-        """Return a validated document for the expected original-image size."""
+    def load(self, image_path, width, height, *, include_catalog=True):
+        """Load boxes for the expected image size and optionally the legacy catalog."""
         expected = self._empty_document(image_path, width, height)
         sidecar = self.sidecar_path(image_path)
         try:
@@ -189,9 +218,10 @@ class AnnotationStore:
             expected["boxes"] = _validate_boxes(
                 document.get("boxes"), expected["width"], expected["height"]
             )
-            expected["label_catalog"] = LabelCatalog(
-                document.get("label_catalog", [])
-            ).to_list()
+            if include_catalog:
+                expected["label_catalog"] = LabelCatalog(
+                    document.get("label_catalog", [])
+                ).to_list()
         except AnnotationValidationError as error:
             raise AnnotationValidationError(f"标注文件无效：{sidecar}\n{error}") from error
         return expected

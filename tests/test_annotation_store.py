@@ -23,6 +23,40 @@ class LabelCatalogTests(unittest.TestCase):
         for text in ("待定1", "11", "1号", "Scratch", "划痕", "新缺陷"):
             self.assertEqual(catalog.resolve(text), text)
 
+    def test_defaults_match_defect_model_ids_and_labels(self):
+        expected = [
+            {"name": "掉漆", "aliases": ["0", "drop_paint"]},
+            {"name": "划痕", "aliases": ["1", "scratch"]},
+            {"name": "污渍", "aliases": ["2", "stain"]},
+            {"name": "其他", "aliases": ["3", "other"]},
+        ]
+        catalog = LabelCatalog.defaults()
+        self.assertEqual(catalog.to_list(), expected)
+        for record in expected:
+            for token in record["aliases"]:
+                self.assertEqual(catalog.resolve(token), record["name"])
+        catalog.add_label("脱落")
+        self.assertEqual(LabelCatalog.defaults().to_list(), expected)
+        self.assertEqual(LabelCatalog().to_list(), [])
+
+    def test_legacy_defaults_preserve_existing_token_owners_and_row_order(self):
+        records = [
+            {"name": "划痕", "aliases": ["1"]},
+            {"name": "脱落", "aliases": ["2", "掉漆"]},
+            {"name": "污渍", "aliases": ["3"]},
+            {"name": "other", "aliases": []},
+        ]
+        catalog = LabelCatalog.from_legacy(records)
+        self.assertEqual(catalog.to_list(), [
+            {"name": "划痕", "aliases": ["1", "scratch"]},
+            {"name": "脱落", "aliases": ["2", "掉漆"]},
+            {"name": "污渍", "aliases": ["3", "stain"]},
+            {"name": "other", "aliases": []},
+            {"name": "其他", "aliases": []},
+        ])
+        self.assertEqual(LabelCatalog.from_legacy(catalog.to_list()).to_list(), catalog.to_list())
+        self.assertEqual(LabelCatalog.from_legacy([]).to_list(), LabelCatalog.defaults().to_list())
+
     def test_alias_conflicts_and_duplicate_names_are_rejected(self):
         bad_records = [
             [{"name": "划痕", "aliases": ["1"]}, {"name": "污渍", "aliases": ["1"]}],
@@ -94,6 +128,21 @@ class AnnotationStoreTests(unittest.TestCase):
                 self.store.save(self.image, 10, 10, [], self.catalog)
         self.assertEqual(Path(path).read_bytes(), before)
         self.assertEqual(list(Path(self.directory.name).glob("*.tmp")), [])
+
+    def test_boxes_can_load_independently_of_invalid_legacy_aliases(self):
+        path = Path(self.store.save(self.image, 10, 10, self.boxes))
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["label_catalog"] = [{"name": "划痕", "aliases": ["划痕"]}]
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(AnnotationValidationError):
+            self.store.load(self.image, 10, 10)
+        loaded = self.store.load(self.image, 10, 10, include_catalog=False)
+        self.assertEqual(loaded["boxes"], self.boxes)
+        self.assertEqual(loaded["label_catalog"], [])
+        document["boxes"][0]["bbox"] = [0, 0, 11, 10]
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(AnnotationValidationError, "超出原图"):
+            self.store.load(self.image, 10, 10, include_catalog=False)
 
     def test_corrupt_file_is_reported_and_left_untouched(self):
         path = Path(self.store.sidecar_path(self.image))

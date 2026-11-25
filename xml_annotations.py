@@ -48,6 +48,11 @@ class ImageEntry:
         nested = self.image.parent / "xml" / adjacent.name
         matches = {p for p in (adjacent, nested) if p.is_file()}
         if self.xml is not None:
+            # A case-insensitive Mac volume can open XML/Foo.XML via xml/foo.xml,
+            # although those spellings are unequal to pathlib on macOS.
+            if self.xml.is_file():
+                matches = {p for p in matches if str(p).casefold() != str(self.xml).casefold()
+                           or not p.samefile(self.xml)}
             matches.add(self.xml)
         if len(matches) > 1:
             raise ValueError("存在多份同名 XML，请确认对应文件后重新打开。")

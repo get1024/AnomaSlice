@@ -1,4 +1,4 @@
-# AnomaSlice — Windows 图片标注与切图
+# AnomaSlice — Windows 和 macOS 图片标注与切图
 
 原生 Qt 桌面应用，支持人工框选标注与切图分类。所有数据保存在本机。
 运行时只依赖 PySide6 Essentials；图片读写、裁剪、绘制均使用 Qt，不使用 OpenCV、NumPy 或模型。
@@ -11,6 +11,10 @@
 下载后双击运行，也可以将这个 EXE 直接拷给其他 Windows x64 电脑使用。
 无需安装 Python、Conda 或额外运行环境，不需要随附 `_internal` 文件夹。
 
+**Mac（macOS 14 或更新版本）**：在[构建记录](https://github.com/get1024/AnomaSlice/actions/workflows/release.yml)中打开对应分支的成功构建，登录 GitHub 后下载 Mac 产物。苹果菜单 →“关于本机”显示 Apple 芯片时选 `arm64`，显示 Intel 处理器时选 `x86_64`。解压下载内容，直到看到 `AnomaSlice.app`，将它拖入「应用程序」后双击打开。文中 Ctrl 快捷键在 Mac 上使用 ⌘，例如 ⌘S 保存。
+
+Mac 构建尚未经 Apple 公证。首次打开时如果系统提示无法验证开发者，请先核对下载来源，再按 [Apple 的打开说明](https://support.apple.com/zh-cn/102445)操作。
+
 ## 框选标注（默认模式）
 
 1. 点击 **打开数据集…**（Ctrl+I），选择图片文件夹。应用会列出其中及子目录里的图片。要打开单张图片或已有缺陷 XML，点击“选文件夹”右侧的小箭头选文件。只做人工标注时，两项 XML 来源都留空。
@@ -19,11 +23,20 @@
 4. **双击**框修改标签，**单击**框后按 **Delete** 删除。框重叠时可通过左侧编号列表选中指定框。
 5. **Ctrl+Z** 撤回，**Ctrl+Shift+Z** 重做。点“保存 XML”或按 **Ctrl+S** 写入当前图片的标注。切换图片、切换到切图模式或关闭窗口时，未保存的修改会提示处理。
 
-“缺陷种类与别名”中每行填写一个类别，多个别名用逗号分隔。
-例如类别“划痕”的别名为 `1, scratch`，输入 `1` 保存为“划痕”，
-输入 `待定1` 保持原样。只对完整文本匹配，区分大小写。
-可以直接输入新类别；重复或冲突的别名会提示修正。
-修改类别表影响后续输入，已有框的标签文字保持原样。
+“缺陷种类与别名”默认使用 Defect 模型的四个类别。
+
+| 写入 XML 的类别 | 编号别名 | 英文别名 |
+| --- | --- | --- |
+| 掉漆 | `0` | `drop_paint` |
+| 划痕 | `1` | `scratch` |
+| 污渍 | `2` | `stain` |
+| 其他 | `3` | `other` |
+
+新框输入 `1` 或 `scratch` 会保存为“划痕”。别名按完整文本匹配，区分大小写。直接输入 `待定1` 等自由文本只会给当前框命名。已有框保留原标签。
+
+要设置常用类别，打开“缺陷种类与别名”，每行填写一个类别，多个别名用逗号分隔。直接打开图片、XML 或文件夹时共用全局类别表。通过“打开工程”进入的工程可以单独设置类别，点击“保存”即写入该工程。浏览图片、导入旧标注或确认框标签都不会向类别表添加条目。
+
+首次读取旧类别表时，应用会补齐尚未占用的默认类别与别名，已自定义的映射优先。要完全采用上表的编号，点击“恢复默认四类”，核对后点击“保存”。保存后的增删在下次启动或重开工程时仍然有效。
 
 ### 同图对照 GT 和模型预测
 
@@ -116,4 +129,15 @@ python -m unittest discover -s tests -v
 python main.py --smoke-test
 ```
 
-发布流程先执行测试，再验证打包后 EXE 在隔离 PATH 下独立启动，成功后发布 Release。
+在 Mac 上使用 Python 3.12 构建与本机架构对应的应用：
+
+```bash
+python3.12 -m venv build/mac-venv
+source build/mac-venv/bin/activate
+python -m pip install -r requirements-build.txt
+bash build-macos.sh
+```
+
+构建脚本会解压并启动打包好的应用，检查图片编解码、标注读写、工程保存和切图导出。通过后可分发 `dist/AnomaSlice-macOS-arm64.zip` 或 `dist/AnomaSlice-macOS-x86_64.zip`。
+
+GitHub Actions 分别在 Windows、Apple 芯片 Mac 和 Intel Mac 上运行测试和打包。手动触发可下载构建产物，推送版本标签时会把三个包附到同一份 Release。

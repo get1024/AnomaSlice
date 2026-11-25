@@ -201,6 +201,24 @@ class BoxCanvasTests(unittest.TestCase):
         self.assertFalse(self.canvas.has_pending_annotation())
         self.assertEqual(self.canvas.get_annotations(), [])
 
+    def test_confirming_existing_label_preserves_text_and_edit_history(self):
+        point = self.canvas.mapFromScene(QPointF(130, 130))
+        for original, entered in (("1", None), ("划痕", None), ("划痕", "1")):
+            with self.subTest(original=original, entered=entered):
+                boxes = [{"label": original, "bbox": [100, 100, 100, 80], "source_id": 0}]
+                self.canvas.set_annotations(boxes)
+                self.changes.clear()
+                QTest.mouseDClick(self.canvas.viewport(), Qt.LeftButton, Qt.NoModifier, point)
+                self.assertTrue(self.canvas.has_pending_annotation())
+                editor = self.canvas._label_editor
+                if entered is not None:
+                    editor.setText(entered)
+                QTest.keyClick(editor, Qt.Key_Return)
+                self.assertFalse(self.canvas.has_pending_annotation())
+                self.assertEqual(self.canvas.get_annotations(), boxes)
+                self.canvas.annotation_undo()
+                self.assertEqual(self.changes, [])
+
     def test_zoom_pan_and_resize_keep_source_geometry(self):
         cursor = QPoint(450, 300)
         before = self.canvas.mapToScene(cursor)

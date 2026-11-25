@@ -10,11 +10,65 @@ import hashlib
 import json
 import os
 import tempfile
+from contextlib import contextmanager
+from copy import deepcopy
 
-from PySide6.QtCore import QIODevice, QSaveFile
+from PySide6.QtCore import QIODevice, QLockFile, QSaveFile
 from PySide6.QtGui import QImage
 
 from annotation_store import LabelCatalog
+
+
+def write_json_atomic(json_path, data):
+    """Replace a UTF-8 JSON document only after its contents are on disk."""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=os.path.dirname(os.path.abspath(json_path)),
+            suffix=".tmp", delete=False,
+        ) as stream:
+            temporary_path = stream.name
+            json.dump(data, stream, indent=4, ensure_ascii=False, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, json_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+
+
+@contextmanager
+def json_write_lock(path):
+    """Serialize read-modify-write operations from application instances."""
+    lock = QLockFile(os.fspath(path) + ".lock")
+    lock.setStaleLockTime(0)  # Mask saves can exceed the default 30-second timeout.
+    if not lock.tryLock(0):
+        raise OSError(f"无法锁定文件以保存，请检查目录权限或稍后重试：{path}")
+    try:
+        yield
+    finally:
+        lock.unlock()
+
+
+def _read_project(json_path):
+    with open(json_path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict) or "images" not in data or "config" not in data:
+        raise ValueError("这不是 AnomaSlice 工程文件；图片标注 JSON 请通过打开对应图片载入。")
+    if data.get("version") not in ("1.0", "1.1"):
+        raise ValueError("不支持的 AnomaSlice 工程版本。")
+    if not isinstance(data["config"], dict):
+        raise ValueError("工程参数 config 必须是 JSON 对象。")
+    return data
+
+
+def _catalog_fields(config):
+    return {key: deepcopy(config[key]) for key in ("label_catalog", "label_catalog_version")
+            if key in config}
 
 
 class ProjectManager:
@@ -25,6 +79,7 @@ class ProjectManager:
         self.annotations = {}
         self.current_index = -1
         self.config = {}
+        self._saved_catalog = {}
         self.normal_dir = None
         self.abnormal_dir = None
 
@@ -50,8 +105,7 @@ class ProjectManager:
         if not output.commit():
             raise OSError(f"无法提交工程掩膜：{path}\n{output.errorString()}")
 
-    def save_project(self, json_path, current_index, config, normal_files=None, abnormal_files=None):
-        json_path = os.path.abspath(os.fspath(json_path))
+    def _save_project_masks(self, json_path):
         base_dir = os.path.dirname(json_path)
         project_name = os.path.splitext(os.path.basename(json_path))[0]
         mask_dir = os.path.join(base_dir, project_name + "_masks")
@@ -64,38 +118,47 @@ class ProjectManager:
             save_path = os.path.join(mask_dir, f"{base_name}_{name_hash}.png")
             self._save_mask(mask, save_path)
             mask_paths_map[img_path] = os.path.relpath(save_path, base_dir)
+        return mask_paths_map
+
+    def save_project(self, json_path, current_index, config, normal_files=None, abnormal_files=None):
+        json_path = os.path.abspath(os.fspath(json_path))
         data = {
             "version": "1.1", "images": self.images, "current_index": current_index,
-            "config": config, "masks": mask_paths_map, "annotations": self.annotations,
+            "config": config, "annotations": self.annotations,
             "normal_files": normal_files if normal_files is not None else [],
             "abnormal_files": abnormal_files if abnormal_files is not None else [],
         }
-        temporary_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=base_dir, suffix=".tmp", delete=False,
-            ) as stream:
-                temporary_path = stream.name
-                json.dump(data, stream, indent=4, ensure_ascii=False, allow_nan=False)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_path, json_path)
-            temporary_path = None
-        finally:
-            if temporary_path is not None:
-                try:
-                    os.unlink(temporary_path)
-                except OSError:
-                    pass
+        with json_write_lock(json_path):
+            if self.project_path and os.path.normcase(json_path) == os.path.normcase(
+                os.path.abspath(self.project_path)
+            ):
+                self._check_catalog_snapshot(_read_project(json_path)["config"])
+            data["masks"] = self._save_project_masks(json_path)
+            write_json_atomic(json_path, data)
         self.project_path = json_path
+        self.config = deepcopy(config)
+        self._saved_catalog = _catalog_fields(config)
+
+    def _check_catalog_snapshot(self, config):
+        if _catalog_fields(config) != self._saved_catalog:
+            raise ValueError("工程的缺陷种类与别名已被其他操作修改，请重新打开工程后再保存。")
+
+    def save_label_catalog(self, catalog):
+        """Update just the catalog in the current project, preserving other on-disk edits."""
+        if not self.project_path:
+            raise ValueError("请先打开或保存工程。")
+        records = catalog.to_list()
+        with json_write_lock(self.project_path):
+            data = _read_project(self.project_path)
+            config = data["config"]
+            self._check_catalog_snapshot(config)
+            config.update(label_catalog=records, label_catalog_version=1)
+            write_json_atomic(self.project_path, data)
+        self._saved_catalog = _catalog_fields(config)
+        self.config.update(_catalog_fields(config))
 
     def load_project(self, json_path):
-        with open(json_path, "r", encoding="utf-8") as stream:
-            data = json.load(stream)
-        if not isinstance(data, dict) or "images" not in data or "config" not in data:
-            raise ValueError("这不是 AnomaSlice 工程文件；图片标注 JSON 请通过打开对应图片载入。")
-        if data.get("version") not in ("1.0", "1.1"):
-            raise ValueError("不支持的 AnomaSlice 工程版本。")
+        data = _read_project(json_path)
 
         def path_list(value, description):
             if not isinstance(value, list) or any(
@@ -110,14 +173,12 @@ class ProjectManager:
             raise ValueError("工程中的当前图片编号必须是整数。")
         if (images and not 0 <= current_index < len(images)) or (not images and current_index != -1):
             raise ValueError("工程中的当前图片编号超出图片列表范围。")
-        config = data["config"]
-        if not isinstance(config, dict):
-            raise ValueError("工程参数 config 必须是 JSON 对象。")
-        config = dict(config)
+        config = dict(data["config"])
         for key, minimum, maximum in (
             ("patch_width", 1, 8192), ("patch_height", 1, 8192),
             ("stride", 1, 8192), ("threshold", 0, 100),
             ("mask_opacity", 0, 100), ("mode", 0, 1),
+            ("label_catalog_version", 1, 1),
         ):
             if key in config:
                 value = config[key]
@@ -175,6 +236,7 @@ class ProjectManager:
         self.images = images
         self.current_index = current_index
         self.config = config
+        self._saved_catalog = _catalog_fields(data["config"])
         self.annotations = validated_annotations
         self.masks = masks
         self.normal_dir = config.get("normal_dir")

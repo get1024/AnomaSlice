@@ -5,7 +5,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from annotation_store import LabelCatalog
 from project_store import ProjectManager
 
 
@@ -43,6 +45,52 @@ class ProjectLoadingTests(unittest.TestCase):
         self.manager.load_project(str(self.path))
         self.assertEqual(self.manager.images, [])
         self.assertEqual(self.manager.current_index, -1)
+
+    def test_catalog_only_save_updates_latest_project_without_touching_other_fields(self):
+        self.write_document(self.document)
+        self.manager.load_project(self.path)
+        # Another process has changed annotations and a slicing parameter.
+        self.document["annotations"]["当前.png"] = []
+        self.document["config"]["stride"] = 32
+        self.document["masks"] = {"当前.png": "missing.png"}
+        self.write_document(self.document)
+        catalog = LabelCatalog.defaults()
+        self.manager.save_label_catalog(catalog)
+        self.document["config"].update(label_catalog=catalog.to_list(), label_catalog_version=1)
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), self.document)
+        self.manager.save_label_catalog(LabelCatalog())
+        self.assertEqual(self.manager.config["label_catalog"], [])
+
+    def test_stale_catalog_conflicts_preserve_disk_and_memory(self):
+        self.write_document(self.document)
+        self.manager.load_project(self.path)
+        before_config = copy.deepcopy(self.manager.config)
+        self.document["config"]["label_catalog"] = [{"name": "外部编辑", "aliases": []}]
+        self.write_document(self.document)
+        before_disk = self.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "重新打开工程"):
+            self.manager.save_label_catalog(LabelCatalog.defaults())
+        with self.assertRaisesRegex(ValueError, "重新打开工程"):
+            self.manager.save_project(self.path, 0, before_config)
+        self.assertEqual(self.path.read_bytes(), before_disk)
+        self.assertEqual(self.manager.config, before_config)
+
+    def test_catalog_write_failure_after_save_as_can_be_retried(self):
+        self.write_document(self.document)
+        self.manager.load_project(self.path)
+        new_path = self.path.with_name("另存工程.json")
+        catalog = LabelCatalog.defaults()
+        config = {"label_catalog": catalog.to_list(), "label_catalog_version": 1}
+        self.manager.save_project(new_path, 0, config)
+        before_disk = new_path.read_bytes()
+        with patch("project_store.os.replace", side_effect=PermissionError("locked")):
+            with self.assertRaises(OSError):
+                self.manager.save_label_catalog(LabelCatalog())
+        self.assertEqual(self.manager.config, config)
+        self.assertEqual(new_path.read_bytes(), before_disk)
+        self.manager.save_label_catalog(LabelCatalog())
+        self.assertEqual(json.loads(new_path.read_text(encoding="utf-8"))["config"]["label_catalog"], [])
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), self.document)
 
     def test_image_sidecar_is_rejected_without_replacing_active_project(self):
         before = copy.deepcopy(self.manager.__dict__)
