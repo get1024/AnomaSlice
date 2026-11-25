@@ -20,7 +20,7 @@ class QtSlicerTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.root = Path(self.directory.name)
+        self.root = Path(self.directory.name).resolve()
         self.normal = self.root / "正常"
         self.abnormal = self.root / "缺陷"
 
