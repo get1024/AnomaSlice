@@ -9,12 +9,15 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
-from PySide6.QtGui import QAction, QColor, QImage, QWheelEvent
+from PySide6.QtGui import (
+    QAction, QColor, QImage, QInputDevice, QNativeGestureEvent, QPointingDevice, QWheelEvent,
+)
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMainWindow
 
@@ -69,13 +72,64 @@ class BoxCanvasTests(unittest.TestCase):
         QTest.keyClick(self.canvas._label_editor, Qt.Key_Return)
         self.assertFalse(self.canvas.has_pending_annotation())
 
-    def wheel(self, point, delta=120):
+    def wheel(self, point, delta=120, pixel_delta_y=0):
         event = QWheelEvent(
             QPointF(point), QPointF(self.canvas.viewport().mapToGlobal(point)),
-            QPoint(), QPoint(0, delta), Qt.NoButton, Qt.NoModifier,
+            QPoint(0, pixel_delta_y), QPoint(0, delta), Qt.NoButton, Qt.NoModifier,
             Qt.NoScrollPhase, False,
         )
         self.app.sendEvent(self.canvas.viewport(), event)
+
+    def trackpad(self):
+        return QPointingDevice(
+            "Trackpad", 42, QInputDevice.DeviceType.TouchPad, QPointingDevice.PointerType.Finger,
+            QInputDevice.Capability.Position, 5, 0,
+        )
+
+    def test_mac_two_finger_scroll_moves_image_in_both_axes_without_zoom(self):
+        viewport = self.canvas.viewport()
+        point = QPoint(370, 260)
+        image_point = self.canvas.mapToScene(point)
+        delta = QPoint(20, -13)
+        scale = self.canvas.transform().m11()
+        device = self.trackpad()
+        with patch.object(sys, "platform", "darwin"):
+            event = QWheelEvent(
+                QPointF(point), QPointF(viewport.mapToGlobal(point)), delta, QPoint(30, -30),
+                Qt.NoButton, Qt.NoModifier, Qt.ScrollUpdate, False,
+                Qt.MouseEventNotSynthesized, device,
+            )
+            self.app.sendEvent(viewport, event)
+            self.assertEqual(self.canvas.transform().m11(), scale)
+            self.assertLessEqual((self.canvas.mapFromScene(image_point) - point - delta).manhattanLength(), 2)
+            self.wheel(point, pixel_delta_y=15)
+            self.assertGreater(self.canvas.transform().m11(), scale)
+
+    def test_mac_native_pinch_zooms_in_and_out_around_fingers(self):
+        viewport = self.canvas.viewport()
+        point = QPoint(340, 230)
+        anchor = self.canvas.mapToScene(point)
+        device = self.trackpad()
+        with patch.object(sys, "platform", "darwin"):
+            for value in (0.25, -0.2):
+                before = self.canvas.transform().m11()
+                event = QNativeGestureEvent(
+                    Qt.ZoomNativeGesture, device, 2, QPointF(point),
+                    QPointF(viewport.mapTo(self.window, point)), QPointF(viewport.mapToGlobal(point)),
+                    value, QPointF(),
+                )
+                self.app.sendEvent(viewport, event)
+                after = self.canvas.transform().m11()
+                if value > 0:
+                    self.assertGreater(after, before)
+                else:
+                    self.assertLess(after, before)
+                self.assertLessEqual((self.canvas.mapFromScene(anchor) - point).manhattanLength(), 3)
+            self.assertFalse(self.canvas.has_pending_annotation())
+            # macOS delivers its accessibility three-finger drag as a primary-button drag.
+            self.drag((100, 100), (200, 180))
+            self.commit("scratch")
+            self.assertEqual(self.canvas.get_annotations()[0]["label"], "scratch")
 
     def test_exact_alias_matching_and_source_coordinates(self):
         self.drag((100, 100), (200, 180))

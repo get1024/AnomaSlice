@@ -251,9 +251,11 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         undo_key = self.undo_action.shortcut().toString(native_text)
         redo_key = self.redo_action.shortcut().toString(native_text)
+        navigation_help = ("触控板：双指滑动平移，双指捏合或张开缩放，三指拖动画框。"
+                           if sys.platform == "darwin" else "滚轮缩放，右键拖动平移。")
         self.annotation_help = QLabel(
             f"左键拖动画框，Enter 确认标签。\n单击选框，双击改标签，{delete_key} 删除。\n"
-            f"滚轮缩放，右键拖动平移。\n{undo_key} 撤回，{redo_key} 重做。"
+            f"{navigation_help}\n{undo_key} 撤回，{redo_key} 重做。"
         )
         self.annotation_help.setWordWrap(True)
         layout.addWidget(self.annotation_help)

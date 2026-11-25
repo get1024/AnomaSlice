@@ -5,7 +5,7 @@ import math
 import sys
 
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetricsF, QKeySequence, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QInputDevice, QKeySequence, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsItem,
@@ -205,27 +205,48 @@ class BoxCanvasMixin:
         self._user_view_adjusted = False
         super().reset_view()
 
-    def wheelEvent(self, event):
-        if not self._has_image():
-            event.accept()
-            return
-        delta = event.angleDelta().y() or event.pixelDelta().y()
-        if not delta:
-            event.accept()
-            return
-        pos = event.position().toPoint()
-        before = self.mapToScene(pos)
-        current = max(abs(self.transform().m11()), 0.00001)
-        target = current * (1.25 ** (delta / 120.0))
-        target = min(max(target, self._fit_scale * 0.1), max(64.0, self._fit_scale * 20))
-        self.scale(target / current, target / current)
+    def _pan_by(self, pixels):
+        horizontal = self.horizontalScrollBar()
+        vertical = self.verticalScrollBar()
+        horizontal.setValue(horizontal.value() - pixels.x())
+        vertical.setValue(vertical.value() - pixels.y())
         self._user_view_adjusted = True
-        self._expand_view_scene()
-        after = self.mapToScene(pos)
-        center = self.mapToScene(self.viewport().rect().center())
-        self.centerOn(center + before - after)
         if self.has_pending_annotation():
             self._position_label_editor()
+
+    def _zoom_at(self, pos, factor):
+        current = max(abs(self.transform().m11()), 0.00001)
+        target = current * factor
+        target = min(max(target, self._fit_scale * 0.1), max(64.0, self._fit_scale * 20))
+        if target == current:
+            return
+        anchor = self.mapToScene(pos)
+        self.scale(target / current, target / current)
+        self._expand_view_scene()
+        self._pan_by(pos - self.mapFromScene(anchor))
+
+    def viewportEvent(self, event):
+        if (event.type() == QEvent.NativeGesture and sys.platform == "darwin"
+                and event.gestureType() == Qt.ZoomNativeGesture and self._has_image()):
+            pos = self.viewport().mapFromGlobal(event.globalPosition()).toPoint()
+            self._zoom_at(pos, 1.0 + event.value())
+            event.accept()
+            return True
+        return super().viewportEvent(event)
+
+    def wheelEvent(self, event):
+        if self._has_image():
+            # Cocoa also supplies pixelDelta for a notched mouse wheel.
+            if sys.platform == "darwin" and (
+                event.phase() != Qt.NoScrollPhase or event.deviceType() == QInputDevice.DeviceType.TouchPad
+            ):
+                pixels = event.pixelDelta()
+                if not pixels.isNull():
+                    self._pan_by(pixels)
+            else:
+                delta = event.angleDelta().y() or event.pixelDelta().y()
+                if delta:
+                    self._zoom_at(event.position().toPoint(), 1.25 ** (delta / 120.0))
         event.accept()
 
     def mousePressEvent(self, event):
@@ -263,13 +284,8 @@ class BoxCanvasMixin:
     def mouseMoveEvent(self, event):
         if self._pan_pos is not None:
             pos = event.position().toPoint()
-            delta = self.mapToScene(self._pan_pos) - self.mapToScene(pos)
-            center = self.mapToScene(self.viewport().rect().center())
-            self.centerOn(center + delta)
+            self._pan_by(pos - self._pan_pos)
             self._pan_pos = pos
-            self._user_view_adjusted = True
-            if self.has_pending_annotation():
-                self._position_label_editor()
             event.accept()
             return
         if self._box_start is not None and self._draft_item is not None:
