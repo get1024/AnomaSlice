@@ -106,6 +106,9 @@ class BoxCanvasTests(unittest.TestCase):
             self.assertGreater(self.canvas.transform().m11(), scale)
 
     def test_mac_native_pinch_zooms_in_and_out_around_fingers(self):
+        # A synthetic drag does not activate a background Cocoa window like a real click.
+        self.window.activateWindow()
+        self.assertTrue(QTest.qWaitForWindowActive(self.window))
         viewport = self.canvas.viewport()
         point = QPoint(340, 230)
         anchor = self.canvas.mapToScene(point)
