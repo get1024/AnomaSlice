@@ -70,6 +70,10 @@ jobs:
         env:
           QT_QPA_PLATFORM: cocoa
         run: python -m unittest discover -s tests -p test_bbox_canvas.py -k test_mac_ -v
+      - name: Test category editing on Cocoa
+        env:
+          QT_QPA_PLATFORM: cocoa
+        run: python -m unittest discover -s tests -p test_label_dialog.py -v
       - name: Build and test the Mac application
         run: bash build-macos.sh
       - uses: actions/upload-artifact@v4

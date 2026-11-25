@@ -11,7 +11,7 @@ from PySide6.QtGui import QAction, QIcon, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QListWidget,
     QListWidgetItem, QLabel, QLineEdit, QMainWindow, QPushButton, QCheckBox,
-    QSlider, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QVBoxLayout,
+    QProgressDialog, QSlider, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QToolButton, QVBoxLayout,
     QWidget, QProgressBar, QMenu, QGroupBox, QGridLayout, QMessageBox,
     QComboBox, QStackedWidget,
 )
@@ -21,6 +21,8 @@ from bbox_canvas import BoxCanvasMixin
 from comparison_dialog import ComparisonDialog
 from comparison_paths import ComparisonSources
 from dataset_recall_label import DatasetRecallLabel
+from export_dialog import ExportDialog
+from export_job import ExportJob
 from image_canvas import ScalableImageLabel, SliceCanvas
 from label_dialog import LabelDialog
 from project_store import ProjectManager, json_write_lock, write_json_atomic
@@ -54,6 +56,7 @@ class MainWindow(QMainWindow):
         self._thumbnail_queue = { }
         self._thumbnail_timer = None
         self._slicer_thread = None
+        self._export_thread = None
         self._patch_coords = []
         self._current_patch_index = 0
         self._create_actions()
@@ -98,6 +101,10 @@ class MainWindow(QMainWindow):
         self.open_dataset_action.setShortcut("Ctrl+I")
         self.open_dataset_action.triggered.connect(self._open_dataset)
 
+        self.export_action = QAction("导出图片或缺陷裁剪图…", self)
+        self.export_action.setEnabled(False)
+        self.export_action.triggered.connect(self._export_images)
+
         self.slice_and_next_action = QAction("Slice and Next", self)
         self.slice_and_next_action.setShortcut("Return")
         self.slice_and_next_action.triggered.connect(self._on_slice_and_next)
@@ -108,6 +115,7 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
         file_menu = menubar.addMenu("文件")
         file_menu.addAction(self.open_dataset_action)
+        file_menu.addAction(self.export_action)
         file_menu.addSeparator()
         file_menu.addAction(self.new_project_action)
         file_menu.addAction(self.open_project_action)
@@ -175,6 +183,10 @@ class MainWindow(QMainWindow):
         top.addStretch()
         self.image_position_label = QLabel("打开一张图片后，可继续浏览同文件夹中的图片")
         top.addWidget(self.image_position_label)
+        export_button = QToolButton()
+        export_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        export_button.setDefaultAction(self.export_action)
+        top.addWidget(export_button)
         layout.addLayout(top)
         layout.addWidget(self.main_splitter, 1)
         self.setCentralWidget(container)
@@ -421,28 +433,13 @@ class MainWindow(QMainWindow):
     def _load_annotations(self, path, width, height):
         self._clear_annotation_state()
         try:
-            image_path = Path(path).resolve()
-            if image_path not in self._image_entries:
-                # Older projects store image paths only. Resolve their adjacent annotations on demand.
-                entries = scan_folder(image_path.parent, recursive=False)
-                self._image_entries.update((entry.image, entry) for entry in entries)
-            entry = self._image_entries.get(image_path)
-            if entry is None:
-                raise ValueError("图片已移动，请重新打开文件夹。")
+            entry = ImageEntry.lookup(path, self._image_entries)
             if self._comparison:
-                pair = self._comparison.resolve(image_path)
+                pair = self._comparison.resolve(path)
                 self._load_prediction(pair.prediction)
                 doc = AnnotationXml.open_path(pair.gt)
             else:
-                doc = AnnotationXml.open(entry)
-            if not doc.exists and not self._comparison:
-                legacy = self.annotation_store.load(path, width, height, include_catalog=False)
-                if os.path.isfile(self.annotation_store.sidecar_path(path)):
-                    doc.boxes = legacy["boxes"]
-                else:
-                    doc.boxes = self.annotation_store.validate_boxes(
-                        self.project_manager.annotations.get(path, []), width, height
-                    )
+                doc = AnnotationXml.for_image(entry, width, height, self.project_manager.annotations.get(path, []))
             self._xml_document = doc
             self.canvas.set_annotations(doc.boxes)
             self._show_boxes(doc.boxes)
@@ -917,12 +914,69 @@ class MainWindow(QMainWindow):
             self._load_current_image()
 
     def _populate_image_picker(self, root=None):
+        self.export_action.setEnabled(bool(self._image_list) and self._export_thread is None)
         with QSignalBlocker(self.review_image_picker):
             self.review_image_picker.clear()
             for path in self._image_list:
                 name = str(Path(path).relative_to(root)) if root else path
                 self.review_image_picker.addItem(name)
             self.review_image_picker.setCurrentIndex(self._image_index)
+
+    def _export_images(self):
+        if not self._image_list or self._export_thread is not None:
+            return
+        if self.canvas.has_pending_annotation():
+            QMessageBox.information(self, "请先确认当前框", "请按 Enter 确认标签或按 Esc 取消，再导出图片。")
+            return
+        gt = self.canvas.get_annotations() if self._xml_document is not None else None
+        predictions = self._prediction_boxes
+        dialog = ExportDialog(
+            self, gt_boxes=gt or [], prediction_boxes=(predictions or []) if self._comparison else None,
+            labels=[entry["name"] for entry in self.label_catalog.to_list()],
+            selected_gt=self.canvas.selected_annotation,
+        )
+        accepted = dialog.exec()
+        options = dialog.options
+        dialog.deleteLater()
+        if not accepted:
+            return
+        worker = ExportJob(options, self._image_list, self._image_index, current_image=self._current_image,
+                           current_gt=gt, current_prediction=predictions, comparison=self._comparison,
+                           entries=self._image_entries, project_boxes=self.project_manager.annotations, parent=self)
+        self._export_thread = worker
+        self.export_action.setEnabled(False)
+        progress = QProgressDialog("正在导出图片…", "取消", 0, len(worker.images), self)
+        self._export_progress = progress
+        progress.setWindowTitle("导出标注图片")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.canceled.connect(worker.requestInterruption)
+        worker.progress.connect(progress.setValue)
+        worker.finished.connect(self._export_finished)
+        progress.show()
+        worker.start()
+
+    def _export_finished(self):
+        worker = self._export_thread
+        self._export_progress.hide()
+        self._export_progress.deleteLater()
+        self._export_thread = None
+        self.export_action.setEnabled(bool(self._image_list))
+        title = "导出已取消" if worker.cancelled else "导出结果"
+        message = f"已导出 {worker.written} 个 PNG 文件。"
+        if worker.directory:
+            message += f"\n{worker.directory}"
+        elif not worker.errors and not worker.cancelled:
+            message += "\n所选范围内没有可裁剪的缺陷框。"
+        if worker.errors:
+            if worker.skipped:
+                message += f"\n跳过 {worker.skipped} 张无法读取的图片或标注。"
+            QMessageBox.warning(self, title, message + "\n" + "\n".join(worker.errors))
+        else:
+            QMessageBox.information(self, title, message)
+        worker.deleteLater()
 
     def _open_source(self, folder, selected=None, *, comparison_sources=None):
         source = selected or folder
@@ -1313,6 +1367,10 @@ class MainWindow(QMainWindow):
         self.canvas.set_smart_grid(self.smart_grid_checkbox.isChecked())
 
     def closeEvent(self, event):
+        if self._export_thread is not None:
+            self.statusBar().showMessage("请等待导出完成，或取消导出后关闭窗口。", 5000)
+            event.ignore()
+            return
         if self._slicer_thread is not None and self._slicer_thread.isRunning():
             self.statusBar().showMessage("正在保存切图，请完成后再关闭窗口。", 5000)
             event.ignore()

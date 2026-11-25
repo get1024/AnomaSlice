@@ -5,14 +5,69 @@ import tempfile
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QCoreApplication
-from PySide6.QtGui import QColor, QImage, QPainter
+from PySide6.QtCore import QCoreApplication, QEvent, QPointF, Qt
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter
+from PySide6.QtWidgets import QPushButton
 
 from annotation_store import LabelCatalog
 from app_window import CanvasWidget
+from label_dialog import LabelDialog
 from project_store import ProjectManager
 from slicer import SlicerThread, count_mask_pixels
+from visual_export import iter_visual_exports, save_png
 from xml_annotations import AnnotationXml, scan_folder
+
+
+def _check_visual_export(image, directory):
+    gt = [{"label": "划痕", "bbox": [12, 30, 64, 56]}]
+    pred = [{"label": "划痕", "bbox": [34, 48, 72, 40]}]
+    image = image.scaled(128, 96)
+    for crop, layers, name in [(False, ("gt", "prediction"), "双层整图"),
+                               (True, ("prediction",), "预测缺陷")]:
+        (layer, index, rendered), = iter_visual_exports(
+            image, gt, pred, crops=crop, layers=layers, selected={("prediction", 0)})
+        path = directory / f"{name}.png"
+        save_png(rendered, path)
+        decoded = QImage(str(path))
+        width, height = (72, 40) if crop else (128, 96)
+        if (decoded.width(), decoded.height()) != (width, height):
+            raise RuntimeError(f"Frozen visual export size error: {name}")
+        if crop and (layer, index) != ("prediction", 0):
+            raise RuntimeError("Frozen crop selection failed")
+        colors = {decoded.pixel(x, y) for x in range(width) for y in range(height)}
+        box_colors = {"#00d5e8"} if crop else {"#00d5e8", "#ff0000"}
+        if not all(QColor(color).rgb() in colors for color in box_colors):
+            raise RuntimeError(f"Missing frozen export box: {name}")
+        if not any(min(QColor.fromRgb(pixel).getRgb()[:3]) > 220 for pixel in colors):
+            raise RuntimeError(f"Missing frozen export caption: {name}")
+
+
+def _check_label_dialog(window):
+    dialog = LabelDialog(LabelCatalog.defaults(), window)
+    try:
+        dialog.show()
+        QCoreApplication.processEvents()
+        buttons = {button.text(): button for button in dialog.findChildren(QPushButton)}
+        buttons["添加种类"].click()
+        _, name, aliases = dialog.rows[-1]
+        for field, text in ((name, "凹坑"), (aliases, "dent")):
+            point = field.rect().center()
+            local = QPointF(point)
+            screen = QPointF(field.mapToGlobal(point))
+            for event_type, pressed in ((QEvent.MouseButtonPress, Qt.LeftButton),
+                                        (QEvent.MouseButtonRelease, Qt.NoButton)):
+                event = QMouseEvent(event_type, local, screen, Qt.LeftButton, pressed, Qt.NoModifier)
+                QCoreApplication.sendEvent(field, event)
+            field.insert(text)
+        dialog.rows[0][0].click()
+        buttons["移除所选种类"].click()
+        buttons["保存"].click()
+        if (dialog.result() != LabelDialog.Accepted or
+                len(dialog.catalog.to_list()) != 4 or dialog.catalog.resolve("dent") != "凹坑"):
+            raise RuntimeError("Frozen label editing failed")
+    finally:
+        dialog.close()
+        dialog.deleteLater()
 
 
 def verify_runtime(window):
@@ -26,6 +81,7 @@ def verify_runtime(window):
         loaded = QImage(image_path)
         if loaded.isNull() or loaded.pixelColor(0, 0) != image.pixelColor(0, 0):
             raise RuntimeError("PNG reader did not preserve the image")
+        _check_label_dialog(window)
         mask = QImage(64, 32, QImage.Format_Grayscale8)
         mask.fill(0)
         painter = QPainter(mask)
@@ -107,3 +163,4 @@ def verify_runtime(window):
         for path in completed[0][0] + completed[0][1]:
             if QImage(path).size() != QImage(32, 32, QImage.Format_RGB32).size():
                 raise RuntimeError("Exported crop dimensions are wrong")
+        _check_visual_export(loaded, directory)

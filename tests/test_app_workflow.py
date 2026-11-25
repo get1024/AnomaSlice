@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QMessageBox
 
 from annotation_store import LabelCatalog
 from app_window import MainWindow
@@ -216,19 +216,17 @@ class AppWorkflowTests(unittest.TestCase):
         saved = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual((saved["label_catalog_version"], saved["label_catalog"]), (1, []))
 
-    def test_save_button_commits_the_active_cell_and_releases_dialog(self):
-        def edit_active_cell():
+    def test_save_button_keeps_active_field_and_releases_dialog(self):
+        def edit_active_field():
             dialog = self.app.activeModalWidget()
-            cell = dialog.table.item(0, 1)
-            dialog.table.setCurrentItem(cell)
-            dialog.table.editItem(cell)
-            editor = dialog.table.findChild(QLineEdit)
+            _, _, editor = dialog.rows[0]
+            QTest.mouseClick(editor, Qt.LeftButton)
             editor.selectAll()
             QTest.keyClicks(editor, "0, drop_paint, peel")
             buttons = dialog.findChild(QDialogButtonBox)
             QTest.mouseClick(buttons.button(QDialogButtonBox.Ok), Qt.LeftButton)
 
-        QTimer.singleShot(0, edit_active_cell)
+        QTimer.singleShot(0, edit_active_field)
         self.window.classes_button.click()
         self.assertEqual(self.window.canvas.resolve_label("peel"), "掉漆")
         self.app.sendPostedEvents(None, QEvent.DeferredDelete)

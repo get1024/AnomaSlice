@@ -182,6 +182,35 @@ class ComparisonSources:
         """Return a resolver with directory-name indexes local to one read-only scan."""
         return partial(self._resolve, lookup=_scan_lookup())
 
+    def export_resolver(self, layers):
+        """Read the requested sources. Explicit single layers have independent matching."""
+        layers = tuple(layers)
+        if not layers or set(layers) - {"gt", "prediction"}:
+            raise ValueError("请选择要导出的 XML 来源。")
+        lookup = _scan_lookup()
+        sources = {"gt": self._gt, "prediction": self._prediction}
+        if len(layers) == 1 and sources[layers[0]] is not None:
+            return partial(self._read_explicit_layer, layer=layers[0], source=sources[layers[0]],
+                           lookup=lookup)
+
+        def resolve(image):
+            pair = self._resolve(image, lookup)
+            return {layer: getattr(pair, layer) for layer in layers}
+
+        return resolve
+
+    def _read_explicit_layer(self, image, *, layer, source, lookup):
+        image = self._checked_image(image)
+        path = _one_match(self._explicit_candidates(source, image, lookup))
+        if image == self.selected_image:
+            if layer == "gt" and source.bound_file and not path.is_file():
+                raise ValueError(f"指定的 GT 文件已移动，请重新选择：{path}")
+        else:
+            for configured in (self._gt, self._prediction):
+                if configured and configured.bound_file and same_xml_path(path, configured.bound_file):
+                    raise ValueError(f"{configured.bound_file.name} 已绑定到 {self.selected_image.name}。")
+        return {layer: path}
+
     def _explicit_candidates(self, source, image, lookup, *, protect=False):
         if source.bound_file and image == self.selected_image:
             return [source.bound_file]
@@ -286,13 +315,17 @@ class ComparisonSources:
         # edits requires this exhaustive alias check.
         return matches(self._images.difference(candidates))
 
-    def _resolve(self, image, lookup):
+    def _checked_image(self, image):
         image = Path(image).resolve()
         if image not in self._images:
             raise ValueError("图片不在当前 XML 对照列表中。")
         stem = image.stem.casefold()
         if len(self._by_location[image.parent, stem]) > 1 or (not self.image_root and len(self._by_stem[stem]) > 1):
             raise ValueError(f"{image.stem} 有多张同名图片，无法确定对应 XML。")
+        return image
+
+    def _resolve(self, image, lookup):
+        image = self._checked_image(image)
         name = image.with_suffix(".xml").name
         is_selected = image == self.selected_image
         gt = _one_match(self._explicit_candidates(self._gt, image, lookup)) if self._gt else None

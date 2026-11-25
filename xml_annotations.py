@@ -12,7 +12,10 @@ from xml.parsers.expat import ExpatError
 from PySide6.QtCore import QIODevice, QLockFile, QSaveFile
 from PySide6.QtGui import QColor, QImageReader
 
+from annotation_store import AnnotationStore
 
+
+EXPORT_MARKER = ".anomaslice-export"
 _EMPTY = b"""<?xml version="1.0" encoding="utf-8"?>
 <DefectDetection>
   <RawCount>0</RawCount>
@@ -40,6 +43,16 @@ class ImageEntry:
     image: Path
     xml: Path | None = None
     issue: str = ""
+
+    @staticmethod
+    def lookup(path, entries):
+        image = Path(path).resolve()
+        if image not in entries:
+            # Older projects store paths only. Index the directory once on demand.
+            entries.update((entry.image, entry) for entry in scan_folder(image.parent, recursive=False))
+        if image not in entries:
+            raise ValueError("图片已移动，请重新打开文件夹。")
+        return entries[image]
 
     def target(self):
         if self.issue:
@@ -69,6 +82,9 @@ def scan_folder(root, *, recursive=True):
         raise error
 
     for directory, subdirs, names in root.walk(on_error=report_error):
+        if directory != root and EXPORT_MARKER in names:
+            subdirs.clear()
+            continue
         if not recursive:
             subdirs[:] = [d for d in subdirs if directory == root and d.casefold() == "xml"]
         for name in names:
@@ -165,6 +181,18 @@ class AnnotationXml:
     @classmethod
     def open(cls, entry):
         return cls.open_path(entry.target(), must_exist=entry.xml is not None)
+
+    @classmethod
+    def for_image(cls, entry, width, height, embedded_boxes):
+        """Read plain-mode GT, including adjacent JSON and older projects."""
+        doc = cls.open(entry)
+        if not doc.exists:
+            store = AnnotationStore()
+            if Path(store.sidecar_path(entry.image)).exists():
+                doc.boxes = store.load(entry.image, width, height, include_catalog=False)["boxes"]
+            else:
+                doc.boxes = store.validate_boxes(embedded_boxes, width, height)
+        return doc
 
     @classmethod
     def open_path(cls, path, *, must_exist=False):

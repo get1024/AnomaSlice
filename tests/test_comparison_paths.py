@@ -71,6 +71,8 @@ class ComparisonPathTests(unittest.TestCase):
         self.assertEqual(sources.resolve(self.images[0]).gt, bound)
         with self.assertRaisesRegex(ValueError, "已绑定"):
             sources.resolve(self.images[1])
+        with self.assertRaisesRegex(ValueError, "已绑定"):
+            sources.export_resolver(("gt",))(self.images[1])
 
     def test_gt_cannot_point_to_another_images_prediction(self):
         second_prediction = self.far / "2.xml"
@@ -131,6 +133,33 @@ class ComparisonPathTests(unittest.TestCase):
             photo.parent.mkdir(parents=True)
             photo.touch()
         return root, photos
+
+    def test_export_single_explicit_layer_with_other_flat_file_ambiguous(self):
+        root, photos = self.make_tree()
+        for image in photos:
+            mirrored = self.gt_dir / image.relative_to(root).with_suffix(".xml")
+            mirrored.parent.mkdir()
+            mirrored.touch()
+        (self.far / "sample.xml").touch()
+        for layer, gt, prediction in (("gt", self.gt_dir, self.far),
+                                      ("prediction", self.far, self.gt_dir)):
+            with self.subTest(layer=layer):
+                sources = ComparisonSources(photos[0], gt, prediction, images=photos, image_root=root)
+                independent = sources.export_resolver((layer,))
+                for image in photos:
+                    expected = self.gt_dir / image.relative_to(root).with_suffix(".xml")
+                    self.assertEqual(independent(image), {layer: expected})
+                for resolve in (sources.resolve, sources.export_resolver(("gt", "prediction"))):
+                    with self.assertRaisesRegex(ValueError, "多张同名图片"):
+                        resolve(photos[0])
+
+    def test_export_implicit_layer_preserves_adjacent_binding(self):
+        flat = self.images[0].with_suffix(".xml")
+        flat.touch()
+        sources = self.sources(prediction=self.local)
+        self.assertEqual(sources.export_resolver(("gt",))(self.images[0]), {"gt": flat})
+        self.assertEqual(sources.export_resolver(("prediction",))(self.images[0]),
+                         {"prediction": self.local})
 
     def test_duplicate_stems_in_separate_directories_mirror_by_role(self):
         root, photos = self.make_tree()
