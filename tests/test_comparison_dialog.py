@@ -104,7 +104,7 @@ class ComparisonDialogTests(unittest.TestCase):
     def test_split_buttons_offer_native_folder_and_file_selection(self):
         buttons = self.dialog.findChildren(QToolButton)
         dataset = next(b for b in buttons if b.accessibleName() == "选择图片或文件夹来源")
-        prediction = next(b for b in buttons if b.accessibleName() == "选择模型预测（只读）来源")
+        prediction = next(b for b in buttons if b.accessibleName() == "选择只读对照标签来源")
         self.dialog.gt_edit.setText(str(self.gt))
         with patch("comparison_dialog.QFileDialog.getExistingDirectory", return_value=str(self.root)):
             dataset.click()

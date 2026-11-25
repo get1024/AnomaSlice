@@ -7,6 +7,7 @@ from threading import Event
 import time
 import unittest
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -87,11 +88,11 @@ class DatasetRecallWindowTests(unittest.TestCase):
         canvas._label_editor.setText("划痕")
         QTest.keyClick(canvas._label_editor, Qt.Key_Return)
 
-    def test_unvisited_image_and_unsaved_edits_undo_redo_and_discard(self):
+    def test_unvisited_image_and_unsaved_edits_undo_redo_and_autosave(self):
         gt = self.write_box(self.gt, self.first, "划痕")
         pred = self.write_box(self.pred, self.first, "划痕")
         self.write_box(self.gt, self.second, "污渍")
-        originals = gt.read_bytes(), pred.read_bytes()
+        original_prediction = pred.read_bytes()
         self.open_dataset()
         self.assert_counts(1, 2, 1)
         self.assertEqual(self.window._current_image_path, str(self.first))
@@ -103,15 +104,12 @@ class DatasetRecallWindowTests(unittest.TestCase):
         self.assert_counts(1, 2, 1)
         self.window._redo_current()
         self.assert_counts(0, 1, 1)
-        self.question.return_value = QMessageBox.Cancel
-        self.window._on_next_image()
-        self.assertEqual(self.window._current_image_path, str(self.first))
-        self.assert_counts(0, 1, 1)
-        self.question.return_value = QMessageBox.Discard
         self.window._on_next_image()
         self.assertEqual(self.window._current_image_path, str(self.second))
-        self.assert_counts(1, 2, 1)
-        self.assertEqual((gt.read_bytes(), pred.read_bytes()), originals)
+        self.question.assert_not_called()
+        self.assert_counts(0, 1, 1)
+        self.assertEqual(ET.parse(gt).findtext("Count"), "0")
+        self.assertEqual(pred.read_bytes(), original_prediction)
 
     def test_empty_gt_then_save_and_reopen_without_double_counting(self):
         prediction = self.write_box(self.pred, self.first, "划痕")

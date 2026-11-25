@@ -11,7 +11,7 @@ from PySide6.QtCore import QRectF
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication
 
-from image_canvas import ScalableImageLabel, SliceCanvas
+from image_canvas import ReviewGrid, ScalableImageLabel, SliceCanvas
 
 
 class ImageCanvasTests(unittest.TestCase):
@@ -45,6 +45,17 @@ class ImageCanvasTests(unittest.TestCase):
         self.assertEqual(mask.format(), QImage.Format_Grayscale8)
         self.assertEqual(mask.size(), self.image.size())
         self.assertEqual(self.value(10, 8), 0)
+
+    def test_review_grid_counts_partial_cells_and_locates_edge_pixels(self):
+        grid = ReviewGrid(11, 9, 5)
+        self.assertEqual((grid.columns, grid.rows, len(grid)), (3, 2, 6))
+        for index in range(len(grid)):
+            rect = grid.cell(index)
+            self.assertEqual(grid.index_at(rect.left(), rect.top()), index)
+            self.assertEqual(grid.index_at(rect.right(), rect.bottom()), index)
+        self.assertEqual(grid.cell(5).getRect(), (10, 5, 1, 4))
+        self.assertIsNone(grid.index_at(11, 9))
+        self.assertIsNone(grid.index_at(-0.1, 0))
 
     def test_inclusive_fill_clips_at_last_image_pixel(self):
         self.canvas.ensure_slice_mask()

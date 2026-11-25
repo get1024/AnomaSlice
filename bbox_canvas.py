@@ -4,7 +4,7 @@ from copy import deepcopy
 import math
 import sys
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QInputDevice, QKeySequence, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
 )
 
+from annotation_store import LabelCatalog
 from xml_annotations import label_color
 
 
@@ -79,7 +80,7 @@ class BoxCanvasMixin:
         self._pan_pos = None
         self._user_view_adjusted = False
         self._fit_scale = 1.0
-        self.resolve_label = lambda text: text
+        self.label_catalog = LabelCatalog()
         self.annotations_changed = lambda annotations: None
         self.selection_changed = lambda index: None
         super().__init__(*args, **kwargs)
@@ -88,7 +89,7 @@ class BoxCanvasMixin:
         self.setTransformationAnchor(QGraphicsView.NoAnchor)
         self.setResizeAnchor(QGraphicsView.NoAnchor)
         self._label_editor = QLineEdit(self.viewport())
-        self._label_editor.setPlaceholderText("标签 / 别名 · Enter 确认 · Esc 取消")
+        self._label_editor.setPlaceholderText("别名自动确认 · 自由文本按 Enter")
         self._label_editor.setMinimumWidth(220)
         self._label_editor.setStyleSheet(
             "QLineEdit { background: #202936; color: white; border: 2px solid #49baff;"
@@ -96,7 +97,26 @@ class BoxCanvasMixin:
         )
         self._label_editor.hide()
         self._label_editor.installEventFilter(self)
-        self._label_editor.returnPressed.connect(self._commit_pending_annotation)
+        self._label_editor.returnPressed.connect(self.commit_pending_annotation)
+        self._alias_timer = QTimer(self)
+        self._alias_timer.setSingleShot(True)
+        self._alias_timer.setInterval(800)
+        self._alias_timer.timeout.connect(self.commit_pending_annotation)
+        self._label_editor.textEdited.connect(self._confirm_typed_alias)
+
+    def resolve_label(self, text):
+        return self.label_catalog.resolve(text)
+
+    def _confirm_typed_alias(self, text):
+        self._alias_timer.stop()
+        token = text.strip()
+        if not token or self.resolve_label(token) == token:
+            return
+        # For aliases such as "1" and "10", allow time to type the longer token.
+        if self.label_catalog.has_longer_token(token):
+            self._alias_timer.start()
+        else:
+            self.commit_pending_annotation()
 
     def set_annotation_mode(self, enabled):
         self.cancel_pending_annotation()
@@ -136,7 +156,7 @@ class BoxCanvasMixin:
         color = QColor("#00d5e8")
         pen = QPen(color, 2, Qt.DashLine)
         for index, annotation in enumerate(annotations or []):
-            caption = f'预测 {index + 1} · {annotation["label"]}'
+            caption = f'对照 {index + 1} · {annotation["label"]}'
             items = self._add_box_items(
                 annotation, pen, Qt.NoBrush, caption, color, 14, prediction=True
             )
@@ -167,7 +187,6 @@ class BoxCanvasMixin:
             self.setSceneRect(rect.adjusted(-margin, -margin, margin, margin))
 
     def fit_image(self):
-        self.cancel_pending_annotation()
         self._user_view_adjusted = False
         if not self._has_image():
             return
@@ -176,28 +195,20 @@ class BoxCanvasMixin:
         self.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
         self._fit_scale = max(abs(self.transform().m11()), 0.00001)
         self.centerOn(self._image_rect().center())
+        if self.has_pending_annotation():
+            self._position_label_editor()
 
     def _fit_in_view(self):
         if not self._user_view_adjusted:
             self.fit_image()
-
-    def resizeEvent(self, event):
-        # The original canvas always refits on resize; preserve an inspected detail.
-        QGraphicsView.resizeEvent(self, event)
-        if not self._user_view_adjusted:
-            self._fit_in_view()
         elif self.has_pending_annotation():
             self._position_label_editor()
 
     def load_image(self, path, image=None):
-        self.cancel_pending_annotation()
         self._user_view_adjusted = False
         self.set_annotations([])
         self.set_predictions([])
-        result = super().load_image(path, image=image)
-        if result:
-            self.fit_image()
-        return result
+        return super().load_image(path, image=image)
 
     def reset_view(self):
         self.set_annotations([])
@@ -262,7 +273,7 @@ class BoxCanvasMixin:
                 return
             if self.has_pending_annotation():
                 if self._label_editor.text().strip():
-                    if not self._commit_pending_annotation():
+                    if not self.commit_pending_annotation():
                         event.accept()
                         return
                 else:
@@ -354,12 +365,13 @@ class BoxCanvasMixin:
         self._box_press_pos = None
         self._remove_draft()
         if hasattr(self, "_label_editor"):
+            self._alias_timer.stop()
             self._label_editor.hide()
             self._label_editor.clear()
 
     def _open_label_editor(self, text=""):
         self._label_editor.setText(text)
-        self._label_editor.setToolTip("输入缺陷名称或完整别名；Enter 确认，Esc 取消")
+        self._label_editor.setToolTip("输入完整别名自动确认，自由文本按 Enter 确认，Esc 取消")
         self._label_editor.setStyleSheet(self._label_editor.styleSheet().replace("#ff7373", "#49baff"))
         self._position_label_editor()
         self._label_editor.show()
@@ -380,7 +392,7 @@ class BoxCanvasMixin:
         y = max(8, min(pos.y() - height - 3, self.viewport().height() - height - 8))
         self._label_editor.setGeometry(x, y, width, height)
 
-    def _commit_pending_annotation(self):
+    def commit_pending_annotation(self):
         if not self.has_pending_annotation():
             return False
         value = self._label_editor.text().strip()
@@ -392,7 +404,8 @@ class BoxCanvasMixin:
             original_label = self._annotations[self._rename_index]["label"]
         try:
             # Preserve imported text even if it is now configured as an alias.
-            label = value if value == original_label else self.resolve_label(value)
+            untouched = value == original_label and not self._label_editor.isModified()
+            label = original_label if untouched else self.resolve_label(value)
             if not isinstance(label, str) or not label.strip():
                 raise ValueError("标签不能为空")
             label = label.strip()

@@ -7,7 +7,8 @@ from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
 from visual_export import iter_visual_exports, save_png
-from xml_annotations import AnnotationXml, ImageEntry, xml_io_lock
+from image_dataset import ImageEntry
+from xml_annotations import AnnotationXml, xml_io_lock
 
 
 def _filename_part(text):

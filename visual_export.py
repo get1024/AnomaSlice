@@ -11,7 +11,8 @@ from pathlib import Path
 from PySide6.QtCore import QFile, QIODevice, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QImageWriter, QPainter, QPen
 
-from xml_annotations import EXPORT_PNG_KEY, label_color
+from image_dataset import EXPORT_PNG_KEY
+from xml_annotations import label_color
 
 
 def iter_visual_exports(image, gt_boxes, prediction_boxes, *, crops, layers, selected=None):
@@ -84,13 +85,13 @@ def _render(image, region, boxes):
             if layer == "prediction":
                 color = QColor("#00d5e8")
                 style = Qt.DashLine
-                source = "预测"
+                source = "对照"
             else:
                 color = QColor(annotation.get("color") or "")
                 if not color.isValid():
                     color = QColor(label_color(annotation["label"]))
                 style = Qt.SolidLine
-                source = "GT"
+                source = "可编辑"
             pen_width = min(stroke, rect.width(), rect.height())
             pen = QPen(color, pen_width, style)
             painter.setPen(pen)

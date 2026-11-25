@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QMenu, QMessageBox, QToolButton, QVBoxLayout,
 )
 
-from xml_annotations import image_extensions
+from image_dataset import image_extensions
 
 
 class ComparisonDialog(QDialog):
@@ -23,10 +23,10 @@ class ComparisonDialog(QDialog):
         layout.addLayout(grid)
         self.image_edit = self._add_row(grid, 0, "图片或文件夹", source,
                                         "图片文件夹、单张图片或对应的 XML")
-        self.gt_edit = self._add_row(grid, 1, "GT（可编辑）", gt_source,
-                                     "自动匹配 · 也可指定 GT 的 XML 文件夹或文件")
-        self.prediction_edit = self._add_row(grid, 2, "模型预测（只读）", prediction_source,
-                                             "可选 · 指定预测 XML 文件夹或文件")
+        self.gt_edit = self._add_row(grid, 1, "可编辑标签", gt_source,
+                                     "可选已有 XML 或空文件夹，留空时自动匹配")
+        self.prediction_edit = self._add_row(grid, 2, "只读对照标签", prediction_source,
+                                             "可选 · 指定对照 XML 文件夹或文件")
         grid.setColumnStretch(1, 1)
         self._xml_owners = {edit: self._source_key() for edit in (self.gt_edit, self.prediction_edit)}
         self._current_source = self._source_key() if active_dataset else None
@@ -78,7 +78,7 @@ class ComparisonDialog(QDialog):
         current = self._current_source and self._source_key() == self._current_source
         intro = ("可直接更改当前图片列表的 XML 来源。" if current
                  else "只选图片或文件夹即可开始标注。")
-        self.hint.setText(intro + "对照模型结果时，通常只需再选预测文件夹。")
+        self.hint.setText(intro + "可编辑标签可选空文件夹，首次保存时会创建同名 XML。")
         if current and self._binding_image:
             binding = f"单个 XML 绑定到 {self._binding_image.name}。"
         else:
@@ -144,10 +144,10 @@ class ComparisonDialog(QDialog):
                     image.suffix.lower() == ".xml" or QImageReader(str(image)).canRead())):
                 raise ValueError("请选择已有的图片、图片文件夹或同名 XML。")
             self._clear_stale_sources()
-            gt = self._source(self.gt_edit, " GT")
-            prediction = self._source(self.prediction_edit, "模型预测")
+            gt = self._source(self.gt_edit, "可编辑标签")
+            prediction = self._source(self.prediction_edit, "只读对照标签")
             if gt and prediction and gt.samefile(prediction):
-                raise ValueError("GT 与预测使用了同一来源，请分别指定各自的 XML 文件或文件夹。")
+                raise ValueError("可编辑标签与只读对照标签使用了同一来源，请分别指定文件或文件夹。")
         except (OSError, RuntimeError, ValueError) as error:
             QMessageBox.warning(self, "无法打开标注数据", str(error))
             return

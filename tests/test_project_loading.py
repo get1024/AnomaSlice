@@ -56,7 +56,7 @@ class ProjectLoadingTests(unittest.TestCase):
         self.write_document(self.document)
         catalog = LabelCatalog.defaults()
         self.manager.save_label_catalog(catalog)
-        self.document["config"].update(label_catalog=catalog.to_list(), label_catalog_version=1)
+        self.document["config"].update(label_catalog=catalog.to_list(), label_catalog_version=LabelCatalog.VERSION)
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), self.document)
         self.manager.save_label_catalog(LabelCatalog())
         self.assertEqual(self.manager.config["label_catalog"], [])

@@ -93,7 +93,7 @@ class ComparisonPathTests(unittest.TestCase):
         for image in self.images:
             self.assertEqual(restored.resolve(image), sources.resolve(image))
         custom.unlink()
-        with self.assertRaisesRegex(ValueError, "GT 文件已移动"):
+        with self.assertRaisesRegex(ValueError, "可编辑标签文件已移动"):
             restored.resolve(self.images[0])
         custom.mkdir()
         with self.assertRaisesRegex(ValueError, "重新选择"):

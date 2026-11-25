@@ -122,7 +122,7 @@ class ComparisonWorkflowTests(unittest.TestCase):
         self.assert_layers([], [32])
         self.add_box("人工2")
         self.window._on_prev_image()
-        self.question.assert_called_once()
+        self.question.assert_not_called()
         self.assertEqual(self.saved_labels(self.near / "图2.xml"), ["人工2"])
         self.assert_layers(["GT1", "人工1"], [42])
         self.assertEqual([pred1.read_bytes(), pred2.read_bytes()], original)
@@ -136,6 +136,18 @@ class ComparisonWorkflowTests(unittest.TestCase):
         self.save_shortcut()
         self.assertEqual(self.saved_labels(self.gt / "图1.xml"), ["实测"])
         self.assertEqual(pred.read_bytes(), before)
+
+    def test_empty_editable_folder_creates_only_the_saved_images_xml(self):
+        nested = self.nested_image()
+        self.open_source(self.first.parent, gt=self.gt)
+        self.window.review_image_picker.setCurrentIndex(self.window._image_list.index(str(nested)))
+        self.assert_layers([], [])
+        self.assertEqual(list(self.gt.iterdir()), [])
+        self.add_box("首个标注")
+        self.save_shortcut()
+        target = self.gt / nested.relative_to(self.first.parent).with_suffix(".xml")
+        self.assertEqual(self.saved_labels(target), ["首个标注"])
+        self.assertEqual(list(self.root.rglob("*.xml")), [target])
 
     def test_explicit_separate_files_and_return_to_plain_image(self):
         gt = self.write_xml(self.gt, self.first, "GT")

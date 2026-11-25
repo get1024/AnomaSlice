@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QDialogButtonBox, QMessageBox
 from annotation_store import LabelCatalog
 from app_window import MainWindow
 from label_dialog import LabelDialog
+from project_store import ProjectManager
 from slicer import SlicerThread, count_mask_pixels
 
 
@@ -51,7 +52,8 @@ class AppWorkflowTests(unittest.TestCase):
 
     def tearDown(self):
         self.window._boxes_dirty = False
-        self.window.close()
+        with patch("app_window.QMessageBox.question", return_value=QMessageBox.Discard):
+            self.window.close()
         self.window.deleteLater()
         self.app.processEvents()
         for message in self.messages:
@@ -76,8 +78,12 @@ class AppWorkflowTests(unittest.TestCase):
             dialog.return_value.exec.side_effect = [True, False]
             self.window._edit_labels()
 
-    def test_enter_alias_save_xml_undo_redo_navigation_and_reopen(self):
-        self.commit("1")
+    def test_alias_save_xml_undo_redo_navigation_and_reopen(self):
+        canvas = self.window.canvas
+        canvas._pending_rect = QRectF(20, 30, 60, 70)
+        canvas._open_label_editor()
+        QTest.keyClick(canvas._label_editor, Qt.Key_2)
+        self.assertFalse(canvas.has_pending_annotation())
         self.assertFalse(self.xml_path().exists())
         QTest.keyClick(self.window.canvas, Qt.Key_S, Qt.ControlModifier)
         root = ET.parse(self.xml_path()).getroot()
@@ -100,28 +106,179 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertFalse(list(self.root.rglob("*.annotations.json")))
 
     def test_bbox_mode_is_lazy_and_slice_mode_retains_mask_workflow(self):
-        self.assertEqual(self.window._patch_coords, [])
         self.assertIsNone(self.window.canvas.get_mask())
         self.assertFalse(self.window.slice_and_next_action.isEnabled())
         self.window.mode_combo.setCurrentIndex(1)
         self.app.processEvents()
-        self.assertTrue(self.window._patch_coords)
+        self.assertEqual(len(self.window.canvas.review_grid), 6)
         self.assertIsNotNone(self.window.canvas.get_mask())
-        self.window._on_patch_defect()
+        self.window.btn_defect.click()
         self.assertGreater(count_mask_pixels(self.window.canvas.get_mask()), 0)
         self.window.mode_combo.setCurrentIndex(0)
         self.assertEqual(self.window.canvas.get_annotations(), [])
+
+    def test_fast_navigation_replaces_queued_previews_and_preserves_project_gallery(self):
+        self.window.mode_combo.setCurrentIndex(1)
+        normal = self.root / "Normal"
+        normal.mkdir()
+        paths = [normal / f"{stem}_0_0.png" for stem in ("样本1", "样本10", "样本2")]
+        image = QImage(self.images[0])
+        for path in paths:
+            self.assertTrue(image.save(str(path)))
+        self.window._refresh_gallery()
+        self.window._on_next_image()
+        gallery = self.window.gallery
+        self.assertEqual(gallery.project_files(), ([str(paths[0]), str(paths[2])], []))
+        self.app.processEvents()
+        view = gallery._lists["Normal"]
+        self.assertEqual([view.item(i).text() for i in range(view.count())], [paths[2].name])
+
+    def test_same_stem_images_keep_separate_crops_and_ignore_ambiguous_legacy_files(self):
+        dataset = self.root / "images"
+        for folder, color in (("A", "red"), ("B", "blue")):
+            image_dir = dataset / folder
+            image_dir.mkdir(parents=True)
+            image = QImage(32, 32, QImage.Format_RGB32)
+            image.fill(QColor(color))
+            self.assertTrue(image.save(str(image_dir / "样本.png")))
+        self.window._open_dataset_path(dataset)
+        self.window.mode_combo.setCurrentIndex(1)
+        for spin in (self.window.patch_width_spin, self.window.patch_height_spin, self.window.stride_spin):
+            spin.setValue(32)
+        normal = dataset / "Normal"
+        normal.mkdir()
+        legacy = normal / "样本_0_0.png"
+        self.assertTrue(image.save(str(legacy)))
+        original = legacy.read_bytes()
+        self.window.gallery.reset([str(legacy)])
+        view = self.window.gallery._lists["Normal"]
+        outputs = []
+        for index, color in enumerate(("red", "blue")):
+            self.window._refresh_gallery()
+            self.app.processEvents()
+            self.assertEqual(view.count(), 0)
+            self.window.btn_no_defect.click()
+            self.assertTrue(self.window._on_slice())
+            self.assertTrue(self.window._slicer_thread.wait(5000))
+            self.app.processEvents()
+            self.app.processEvents()
+            self.assertEqual(view.count(), 1)
+            output = Path(view.item(0).toolTip())
+            outputs.append(output)
+            self.assertEqual(QImage(str(output)).pixelColor(0, 0), QColor(color))
+            if index == 0:
+                self.window._on_next_image()
+        self.assertNotEqual(*outputs)
+        self.assertEqual(QImage(str(outputs[0])).pixelColor(0, 0), QColor("red"))
+        self.assertEqual(legacy.read_bytes(), original)
+        self.window._on_prev_image()
+        self.app.processEvents()
+        self.assertEqual(view.count(), 1)
+        self.assertEqual(view.item(0).toolTip(), str(outputs[0]))
+
+    def test_opening_another_dataset_does_not_copy_old_project_state(self):
+        old_image = self.images[0]
+        self.window.project_manager.set_mask(old_image, QImage(old_image))
+        self.window.project_manager.annotations[old_image] = [{"label": "旧框", "bbox": [0, 0, 1, 1]}]
+        new_folder = self.root / "new"
+        new_folder.mkdir()
+        new_path = new_folder / "样本1.png"
+        self.assertTrue(QImage(old_image).save(str(new_path)))
+        self.window._open_dataset_path(new_folder)
+        self.assertEqual(self.window.project_manager.images, [str(new_path)])
+        self.assertFalse(self.window.project_manager.masks)
+        self.assertFalse(self.window.project_manager.annotations)
 
     def test_save_failure_retains_current_document_until_retry(self):
         with patch.object(self.window._xml_document, "save", side_effect=OSError("read only")):
             self.commit("划痕")
             self.assertTrue(self.window._boxes_dirty)
-            self.window._on_next_image()
+            self.window.review_image_picker.setCurrentIndex(1)
             self.assertEqual(self.window._current_image_path, self.images[0])
+            self.assertEqual(self.window.review_image_picker.currentIndex(), 0)
             self.assertEqual(len(self.window.canvas.get_annotations()), 1)
-        self.assertTrue(self.window._save_xml())
         self.window._on_next_image()
         self.assertEqual(self.window._current_image_path, self.images[1])
+        self.assertEqual(ET.parse(self.xml_path()).findtext("Count"), "1")
+
+    def test_slice_navigation_persists_only_edited_masks_and_retries_without_losing_them(self):
+        self.window.mode_combo.setCurrentIndex(1)
+        project = self.root / "review.json"
+        canvas = self.window.canvas
+        with patch("app_window.QFileDialog.getSaveFileName", side_effect=[("", ""), (str(project), "")]) as choose:
+            self.window._on_next_image()
+            self.window._on_prev_image()
+            choose.assert_not_called()
+            self.window.btn_defect.click()
+            first_mask = canvas.get_mask()
+            self.window._on_next_image()
+            self.assertEqual(self.window._image_index, 0)
+            self.assertTrue(canvas.has_mask_changes())
+            self.window._on_next_image()
+            self.assertEqual(self.window._image_index, 1)
+            self.assertEqual(choose.call_count, 2)
+        self.window._on_prev_image()
+        self.assertEqual(canvas.get_mask(), first_mask)
+        canvas.clear_mask()
+        with patch("project_store.write_json_atomic", side_effect=PermissionError("locked")):
+            self.window._on_next_image()
+        self.assertEqual(self.window._image_index, 0)
+        self.assertTrue(canvas.has_mask_changes())
+        reopened = ProjectManager()
+        reopened.load_project(project)
+        self.assertEqual(reopened.get_mask(self.images[0]), first_mask)
+        self.window._on_next_image()
+        self.assertEqual(self.window._image_index, 1)
+        reopened.load_project(project)
+        self.assertEqual(count_mask_pixels(reopened.get_mask(self.images[0])), 0)
+        self.assertIsNone(reopened.get_mask(self.images[1]))
+        self.window.btn_defect.click()
+        with patch("app_window.QFileDialog.getOpenFileName", return_value=(str(project), "")):
+            self.window._on_open_project()
+        self.window._on_next_image()
+        self.assertGreater(count_mask_pixels(canvas.get_mask()), 0)
+        self.window._open_dataset_path(self.root)
+        self.assertEqual(self.window._image_list, self.images)
+
+    def test_close_and_new_project_preserve_changed_mask_on_cancel(self):
+        self.window.mode_combo.setCurrentIndex(1)
+        self.window.btn_defect.click()
+        with patch("app_window.QMessageBox.question", return_value=QMessageBox.Cancel):
+            self.window._on_new_project()
+            self.assertEqual(self.window._image_list, self.images)
+            self.assertFalse(self.window.close())
+        self.assertTrue(self.window.canvas.has_mask_changes())
+
+    def test_navigation_keys_save_edits_and_allow_typing_a_and_d_in_labels(self):
+        canvas = self.window.canvas
+        canvas._pending_rect = QRectF(20, 30, 60, 70)
+        canvas._open_label_editor()
+        QTest.keyClicks(canvas._label_editor, "ad")
+        self.assertEqual(canvas._label_editor.text(), "ad")
+        self.assertEqual(self.window._image_index, 0)
+        QTest.keyClick(canvas._label_editor, Qt.Key_Return)
+        with patch("app_window.QMessageBox.question") as question:
+            QTest.keyClick(canvas, Qt.Key_D)
+            self.assertEqual(self.window._image_index, 1)
+            self.assertEqual(ET.parse(self.xml_path()).findtext("./Detections/Detection/message"), "ad")
+            QTest.keyClick(canvas, Qt.Key_A)
+            self.assertEqual(self.window._image_index, 0)
+            self.assertEqual(canvas.get_annotations()[0]["label"], "ad")
+            self.assertFalse(self.xml_path(1).exists())
+            question.assert_not_called()
+
+    def test_picker_preserves_an_empty_draft_and_saves_a_named_draft(self):
+        canvas = self.window.canvas
+        canvas._pending_rect = QRectF(20, 30, 60, 70)
+        canvas._open_label_editor()
+        self.window.review_image_picker.setCurrentIndex(1)
+        self.assertEqual(self.window._image_index, 0)
+        self.assertEqual(self.window.review_image_picker.currentIndex(), 0)
+        self.assertTrue(canvas.has_pending_annotation())
+        QTest.keyClicks(canvas._label_editor, "custom")
+        self.window.review_image_picker.setCurrentIndex(1)
+        self.assertEqual(self.window._image_index, 1)
+        self.assertEqual(ET.parse(self.xml_path()).findtext("./Detections/Detection/message"), "custom")
 
     def test_corrupt_sidecar_is_never_overwritten(self):
         path = Path(self.images[1] + ".annotations.json")
@@ -200,7 +357,7 @@ class AppWorkflowTests(unittest.TestCase):
         ]}), encoding="utf-8")
         migrated = MainWindow()
         try:
-            for alias, name in (("2", "脱落"), ("3", "污渍"), ("0", "掉漆"),
+            for alias, name in (("2", "脱落"), ("3", "污渍"), ("1", "掉漆"),
                                 ("scratch", "划痕"), ("other", "其他")):
                 self.assertEqual(migrated.canvas.resolve_label(alias), name)
             with patch("app_window.LabelDialog") as dialog:
@@ -214,7 +371,7 @@ class AppWorkflowTests(unittest.TestCase):
             self.window._save_global_config(LabelCatalog.defaults())
         self.window._save_global_config()
         saved = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual((saved["label_catalog_version"], saved["label_catalog"]), (1, []))
+        self.assertEqual((saved["label_catalog_version"], saved["label_catalog"]), (LabelCatalog.VERSION, []))
 
     def test_save_button_keeps_active_field_and_releases_dialog(self):
         def edit_active_field():
@@ -283,17 +440,17 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertEqual(self.window._current_image_path, str(image))
         self.assertEqual([b["label"] for b in canvas.get_annotations()], ["复核划痕", "人工补标"])
 
-    def test_cancel_or_discard_leaving_unsaved_image(self):
+    def test_cancel_or_discard_leaving_annotation_mode(self):
         self.commit("待审核")
         with patch("app_window.QMessageBox.question", return_value=QMessageBox.Cancel):
-            self.window.review_image_picker.setCurrentIndex(1)
             self.window.mode_combo.setCurrentIndex(1)
             self.assertFalse(self.window.close())
         self.assertEqual((self.window.review_image_picker.currentIndex(), self.window.mode_combo.currentIndex()), (0, 0))
         self.assertTrue(self.window._boxes_dirty)
         with patch("app_window.QMessageBox.question", return_value=QMessageBox.Discard):
-            self.window._on_next_image()
-        self.assertEqual(self.window._current_image_path, self.images[1])
+            self.window.mode_combo.setCurrentIndex(1)
+        self.assertEqual(self.window.mode_combo.currentIndex(), 1)
+        self.assertEqual(self.window.canvas.get_annotations(), [])
         self.assertFalse(self.xml_path().exists())
 
     def test_legacy_boxes_import_once_and_existing_xml_takes_precedence(self):

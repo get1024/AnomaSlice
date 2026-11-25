@@ -45,8 +45,8 @@ class LabelDialogTests(unittest.TestCase):
         self.buttons.button(QDialogButtonBox.Ok).click()
         self.assertEqual(self.dialog.result(), QDialog.Accepted)
         self.assertEqual(self.dialog.catalog.to_list(), LabelCatalog.defaults().to_list())
-        for token, english, name in [("0", "drop_paint", "掉漆"), ("1", "scratch", "划痕"),
-                                     ("2", "stain", "污渍"), ("3", "other", "其他")]:
+        for token, english, name in [("1", "drop_paint", "掉漆"), ("2", "scratch", "划痕"),
+                                     ("3", "stain", "污渍"), ("4", "other", "其他")]:
             self.assertEqual(self.dialog.catalog.resolve(token), name)
             self.assertEqual(self.dialog.catalog.resolve(english), name)
         self.assertEqual(self.catalog.to_list(), self.records)
@@ -60,7 +60,7 @@ class LabelDialogTests(unittest.TestCase):
         _, name, aliases = self.dialog.rows[-1]
         QTest.keyClicks(name, "dent")
         QTest.mouseClick(aliases, Qt.LeftButton)
-        QTest.keyClicks(aliases, "4, mark")
+        QTest.keyClicks(aliases, "5, mark")
         for row in (0, 2):
             QTest.mouseClick(self.dialog.rows[row][0], Qt.LeftButton)
         self.click("移除所选种类")

@@ -9,36 +9,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import tempfile
+from collections import Counter
 from contextlib import contextmanager
 from copy import deepcopy
+from pathlib import Path
 
 from PySide6.QtCore import QIODevice, QLockFile, QSaveFile
 from PySide6.QtGui import QImage
 
 from annotation_store import LabelCatalog
-
-
-def write_json_atomic(json_path, data):
-    """Replace a UTF-8 JSON document only after its contents are on disk."""
-    temporary_path = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=os.path.dirname(os.path.abspath(json_path)),
-            suffix=".tmp", delete=False,
-        ) as stream:
-            temporary_path = stream.name
-            json.dump(data, stream, indent=4, ensure_ascii=False, allow_nan=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, json_path)
-        temporary_path = None
-    finally:
-        if temporary_path is not None:
-            try:
-                os.unlink(temporary_path)
-            except OSError:
-                pass
+from image_dataset import EXPORT_MARKER
+from json_storage import write_json_atomic
 
 
 @contextmanager
@@ -75,7 +56,9 @@ class ProjectManager:
     def __init__(self):
         self.project_path = None
         self.images = []
+        self._patch_stems = {}
         self.masks = {}
+        self._saved_masks = {}
         self.annotations = {}
         self.current_index = -1
         self.config = {}
@@ -85,10 +68,26 @@ class ProjectManager:
 
     def set_images(self, images):
         self.images = list(images)
+        stems = {image: Path(image).stem for image in self.images}
+        counts = Counter(stem.casefold() for stem in stems.values())
+        reserved = set(counts)
+        self._patch_stems = {}
+        for image in sorted(image for image, stem in stems.items() if counts[stem.casefold()] > 1):
+            identity = os.path.normcase(os.path.abspath(image))
+            digest = hashlib.sha256(os.fsencode(identity)).hexdigest()[:20]
+            stem = f"{stems[image][:32]}~{digest}"
+            # A real image can itself be named like a generated patch prefix.
+            while stem.casefold() in reserved:
+                stem += "~"
+            self._patch_stems[image] = stem
+            reserved.add(stem.casefold())
+
+    def patch_stem(self, image):
+        return self._patch_stems.get(image, Path(image).stem)
 
     def set_mask(self, image_path, mask):
         if mask is not None and not mask.isNull():
-            self.masks[image_path] = QImage(mask)
+            self.masks[image_path] = mask.convertToFormat(QImage.Format_Grayscale8)
 
     def get_mask(self, image_path):
         mask = self.masks.get(image_path)
@@ -105,23 +104,72 @@ class ProjectManager:
         if not output.commit():
             raise OSError(f"无法提交工程掩膜：{path}\n{output.errorString()}")
 
-    def _save_project_masks(self, json_path):
+    def _stage_masks(self, json_path, masks, existing_paths):
+        """Write outside the live JSON's mask paths until its atomic replacement succeeds."""
         base_dir = os.path.dirname(json_path)
         project_name = os.path.splitext(os.path.basename(json_path))[0]
         mask_dir = os.path.join(base_dir, project_name + "_masks")
-        if self.masks:
-            os.makedirs(mask_dir, exist_ok=True)
+        if masks:
+            try:
+                os.mkdir(mask_dir)
+            except FileExistsError:
+                if not os.path.isdir(mask_dir):
+                    raise
+            else:
+                # Only newly created output directories are known to contain no source images.
+                with open(os.path.join(mask_dir, EXPORT_MARKER), "xb"):
+                    pass
+        live_paths = {os.path.normcase(os.path.abspath(os.path.join(base_dir, path)))
+                      for path in existing_paths.values()}
         mask_paths_map = {}
-        for img_path, mask in self.masks.items():
+        for img_path, mask in masks.items():
             name_hash = hashlib.md5(img_path.encode("utf-8")).hexdigest()
             base_name = os.path.splitext(os.path.basename(img_path))[0]
-            save_path = os.path.join(mask_dir, f"{base_name}_{name_hash}.png")
-            self._save_mask(mask, save_path)
-            mask_paths_map[img_path] = os.path.relpath(save_path, base_dir)
+            stem = os.path.join(mask_dir, f"{base_name}_{name_hash}")
+            slots = (stem + ".png", stem + "_next.png")
+            for save_path in slots:
+                if os.path.normcase(save_path) not in live_paths:
+                    self._save_mask(mask, save_path)
+                    mask_paths_map[img_path] = os.path.relpath(save_path, base_dir)
+                    break
+            else:
+                raise ValueError(f"工程中的多个掩膜引用了同一图片的保存位置：{img_path}")
         return mask_paths_map
 
-    def save_project(self, json_path, current_index, config, normal_files=None, abnormal_files=None):
+    def _check_mask_snapshot(self, image_path, existing_paths):
+        relative = existing_paths.get(image_path)
+        disk_mask = None
+        if relative:
+            target = os.path.join(os.path.dirname(self.project_path), relative)
+            disk = QImage(target)
+            if not disk.isNull():
+                disk_mask = disk.convertToFormat(QImage.Format_Grayscale8)
+            elif os.path.exists(target):
+                raise ValueError(f"无法读取已保存的掩膜：{target}")
+        if disk_mask != self._saved_masks.get(image_path):
+            raise ValueError("当前图片的工程掩膜已被修改，请重新打开工程。")
+
+    def save_image_mask(self, image_path, mask):
+        """Merge one image into the latest project without replacing other reviewers' edits."""
+        path = self.project_path
+        with json_write_lock(path):
+            data = _read_project(path)
+            if image_path not in data["images"]:
+                raise ValueError("当前图片已从工程中移除，请重新打开工程。")
+            paths = self._mask_paths(data)
+            self._check_mask_snapshot(image_path, paths)
+            paths.update(self._stage_masks(path, {image_path: mask}, paths))
+            data["masks"] = paths
+            write_json_atomic(path, data)
+        self.set_mask(image_path, mask)
+        self._saved_masks[image_path] = self.masks[image_path]
+
+    def save_project(self, json_path, current_index, config, normal_files=None, abnormal_files=None,
+                     *, current_mask=None):
         json_path = os.path.abspath(os.fspath(json_path))
+        masks = dict(self.masks)
+        if current_mask is not None:
+            masks[self.images[current_index]] = current_mask.convertToFormat(QImage.Format_Grayscale8)
         data = {
             "version": "1.1", "images": self.images, "current_index": current_index,
             "config": config, "annotations": self.annotations,
@@ -129,15 +177,41 @@ class ProjectManager:
             "abnormal_files": abnormal_files if abnormal_files is not None else [],
         }
         with json_write_lock(json_path):
-            if self.project_path and os.path.normcase(json_path) == os.path.normcase(
+            same_project = self.project_path and os.path.normcase(json_path) == os.path.normcase(
                 os.path.abspath(self.project_path)
-            ):
-                self._check_catalog_snapshot(_read_project(json_path)["config"])
-            data["masks"] = self._save_project_masks(json_path)
+            )
+            previous = {}
+            if same_project or os.path.isfile(json_path):
+                try:
+                    previous = _read_project(json_path)
+                except ValueError:
+                    if same_project:
+                        raise
+            existing_paths = self._mask_paths(previous)
+            if same_project:
+                self._check_catalog_snapshot(previous["config"])
+                changed = {image: mask for image, mask in masks.items() if mask != self._saved_masks.get(image)}
+                for image in changed:
+                    self._check_mask_snapshot(image, existing_paths)
+                data["masks"] = existing_paths | self._stage_masks(json_path, changed, existing_paths)
+            else:
+                data["masks"] = self._stage_masks(json_path, masks, existing_paths)
             write_json_atomic(json_path, data)
         self.project_path = json_path
+        self.masks = masks
         self.config = deepcopy(config)
         self._saved_catalog = _catalog_fields(config)
+        self._saved_masks = dict(self.masks)
+
+    @staticmethod
+    def _mask_paths(data):
+        paths = data.get("masks", {})
+        if not isinstance(paths, dict) or any(
+            not isinstance(image, str) or not image.strip()
+            or not isinstance(path, str) or not path.strip() for image, path in paths.items()
+        ):
+            raise ValueError("工程中的 masks 必须使用图片路径对应掩膜路径。")
+        return paths
 
     def _check_catalog_snapshot(self, config):
         if _catalog_fields(config) != self._saved_catalog:
@@ -152,7 +226,7 @@ class ProjectManager:
             data = _read_project(self.project_path)
             config = data["config"]
             self._check_catalog_snapshot(config)
-            config.update(label_catalog=records, label_catalog_version=1)
+            config.update(label_catalog=records, label_catalog_version=LabelCatalog.VERSION)
             write_json_atomic(self.project_path, data)
         self._saved_catalog = _catalog_fields(config)
         self.config.update(_catalog_fields(config))
@@ -178,7 +252,7 @@ class ProjectManager:
             ("patch_width", 1, 8192), ("patch_height", 1, 8192),
             ("stride", 1, 8192), ("threshold", 0, 100),
             ("mask_opacity", 0, 100), ("mode", 0, 1),
-            ("label_catalog_version", 1, 1),
+            ("label_catalog_version", 1, LabelCatalog.VERSION),
         ):
             if key in config:
                 value = config[key]
@@ -215,13 +289,7 @@ class ProjectManager:
 
         normal_files = path_list(data.get("normal_files", []), "Normal 结果")
         abnormal_files = path_list(data.get("abnormal_files", []), "Abnormal 结果")
-        mask_map = data.get("masks", {})
-        if not isinstance(mask_map, dict) or any(
-            not isinstance(image_path, str) or not image_path.strip()
-            or not isinstance(mask_path, str) or not mask_path.strip()
-            for image_path, mask_path in mask_map.items()
-        ):
-            raise ValueError("工程中的 masks 必须使用图片路径对应掩膜路径。")
+        mask_map = self._mask_paths(data)
         base_dir = os.path.dirname(json_path)
         masks = {}
         for img_path, mask_rel_path in mask_map.items():
@@ -232,13 +300,14 @@ class ProjectManager:
                     raise ValueError(f"无法解码工程掩膜：{full_path}")
                 masks[img_path] = mask.convertToFormat(QImage.Format_Grayscale8)
 
-        self.project_path = os.fspath(json_path)
-        self.images = images
+        self.project_path = os.path.abspath(os.fspath(json_path))
+        self.set_images(images)
         self.current_index = current_index
         self.config = config
         self._saved_catalog = _catalog_fields(data["config"])
         self.annotations = validated_annotations
         self.masks = masks
+        self._saved_masks = dict(masks)
         self.normal_dir = config.get("normal_dir")
         self.abnormal_dir = config.get("abnormal_dir")
         return self.current_index, self.config, normal_files, abnormal_files

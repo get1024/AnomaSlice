@@ -1,5 +1,4 @@
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,12 +22,12 @@ class LabelCatalogTests(unittest.TestCase):
         for text in ("待定1", "11", "1号", "Scratch", "划痕", "新缺陷"):
             self.assertEqual(catalog.resolve(text), text)
 
-    def test_defaults_match_defect_model_ids_and_labels(self):
+    def test_defaults_use_one_based_shortcuts_and_model_labels(self):
         expected = [
-            {"name": "掉漆", "aliases": ["0", "drop_paint"]},
-            {"name": "划痕", "aliases": ["1", "scratch"]},
-            {"name": "污渍", "aliases": ["2", "stain"]},
-            {"name": "其他", "aliases": ["3", "other"]},
+            {"name": "掉漆", "aliases": ["1", "drop_paint"]},
+            {"name": "划痕", "aliases": ["2", "scratch"]},
+            {"name": "污渍", "aliases": ["3", "stain"]},
+            {"name": "其他", "aliases": ["4", "other"]},
         ]
         catalog = LabelCatalog.defaults()
         self.assertEqual(catalog.to_list(), expected)
@@ -52,10 +51,24 @@ class LabelCatalogTests(unittest.TestCase):
             {"name": "脱落", "aliases": ["2", "掉漆"]},
             {"name": "污渍", "aliases": ["3", "stain"]},
             {"name": "other", "aliases": []},
-            {"name": "其他", "aliases": []},
+            {"name": "其他", "aliases": ["4"]},
         ])
         self.assertEqual(LabelCatalog.from_legacy(catalog.to_list()).to_list(), catalog.to_list())
         self.assertEqual(LabelCatalog.from_legacy([]).to_list(), LabelCatalog.defaults().to_list())
+
+    def test_only_untouched_old_defaults_upgrade(self):
+        records = LabelCatalog.defaults().to_list()
+        for i, record in enumerate(records):
+            record["aliases"][0] = str(i)
+        config = {"label_catalog": records}
+        self.assertEqual(LabelCatalog.from_config(config, None).to_list(), LabelCatalog.defaults().to_list())
+        config["label_catalog_version"] = 1
+        self.assertEqual(LabelCatalog.from_config(config, None).to_list(), LabelCatalog.defaults().to_list())
+        config["label_catalog_version"] = LabelCatalog.VERSION
+        self.assertEqual(LabelCatalog.from_config(config, None).to_list(), records)
+        records[0]["aliases"].append("peel")
+        config["label_catalog_version"] = 1
+        self.assertEqual(LabelCatalog.from_config(config, None).to_list(), records)
 
     def test_alias_conflicts_and_duplicate_names_are_rejected(self):
         bad_records = [

@@ -13,6 +13,7 @@ from PySide6.QtGui import QColor, QImage, QPainter
 
 from project_store import ProjectManager
 from slicer import SlicerThread, count_mask_pixels
+from xml_annotations import scan_folder
 
 
 class QtSlicerTests(unittest.TestCase):
@@ -77,6 +78,16 @@ class QtSlicerTests(unittest.TestCase):
         self.assertEqual(output.pixelColor(0, 0), QColor("red"))
         self.assertEqual(self.errors, [])
 
+    def test_dataset_scan_distinguishes_new_crops_from_unmarked_camera_images(self):
+        image = self.image(4, 4)
+        original = self.root / "camera_0_0.png"
+        self.assertTrue(image.save(str(original)))
+        self.worker(image).run()
+        crop = self.normal / "样本_0_0.png"
+        self.assertEqual([entry.image for entry in scan_folder(self.root)], [original])
+        self.assertEqual([entry.image for entry in scan_folder(self.root, selected=crop)], [crop])
+        self.assertEqual([entry.image for entry in scan_folder(self.normal)], [crop])
+
     def test_size_mismatch_reports_error_without_success(self):
         worker = self.worker(self.image(4, 4), self.image(2, 2, True))
         worker.run()
@@ -106,6 +117,25 @@ class QtSlicerTests(unittest.TestCase):
         self.assertEqual(reopened.annotations, manager.annotations)
         self.assertEqual(count_mask_pixels(reopened.get_mask("原图.png")), 1)
         self.assertEqual(reopened.get_mask("原图.png").size(), mask.size())
+
+    def test_mask_autosave_merges_other_images_and_rejects_stale_edits_to_same_image(self):
+        owner = ProjectManager()
+        owner.set_images(["a.png", "b.png"])
+        path = str(self.root / "review.json")
+        owner.save_project(path, 0, {})
+        second = ProjectManager()
+        second.load_project(path)
+        mask = self.image(3, 3, True)
+        mask.setPixelColor(1, 1, QColor("white"))
+        owner.save_image_mask("a.png", mask)
+        second.save_image_mask("b.png", mask)
+        with self.assertRaisesRegex(ValueError, "掩膜已被修改"):
+            second.save_image_mask("a.png", self.image(3, 3, True))
+        second.save_project(path, 1, {})
+        reopened = ProjectManager()
+        reopened.load_project(path)
+        self.assertEqual(reopened.get_mask("a.png"), mask)
+        self.assertEqual(reopened.get_mask("b.png"), mask)
 
 
 if __name__ == "__main__":

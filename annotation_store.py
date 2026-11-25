@@ -10,16 +10,17 @@ from __future__ import annotations
 import json
 import math
 import os
-import tempfile
 from collections.abc import Mapping
 
+from json_storage import write_json_atomic
 
-# IDs and model labels from the GeSi Defect module, in model output order.
+
+# Annotation shortcuts use 1–4; the English names follow model output order.
 _DEFAULT_LABELS = (
-    ("掉漆", "0", "drop_paint"),
-    ("划痕", "1", "scratch"),
-    ("污渍", "2", "stain"),
-    ("其他", "3", "other"),
+    ("掉漆", "1", "drop_paint"),
+    ("划痕", "2", "scratch"),
+    ("污渍", "3", "stain"),
+    ("其他", "4", "other"),
 )
 
 
@@ -48,9 +49,11 @@ def _integer(value, description, minimum=0):
 class LabelCatalog:
     """User-defined labels, with exact, case-sensitive whole-token aliases.
 
-    ``resolve(' 1 ')`` can return ``'划痕'`` while ``resolve('待定1')`` returns
+    ``resolve(' 2 ')`` can return ``'划痕'`` while ``resolve('待定1')`` returns
     ``'待定1'``. Unknown nonempty text is accepted without changing the catalog.
     """
+
+    VERSION = 2
 
     @classmethod
     def defaults(cls):
@@ -59,9 +62,25 @@ class LabelCatalog:
                     for name, class_id, model_label in _DEFAULT_LABELS])
 
     @classmethod
-    def from_legacy(cls, records):
-        """Fill missing defaults while preserving every existing token's meaning."""
-        catalog = cls(records)
+    def from_config(cls, config, fallback):
+        """Upgrade untouched defaults and preserve explicitly saved custom catalogs."""
+        version = config.get("label_catalog_version")
+        if "label_catalog_version" in config and (
+            type(version) is not int or not 1 <= version <= cls.VERSION
+        ):
+            raise ValueError(f"不支持的类别表版本：{version}")
+        if "label_catalog" not in config:
+            return fallback
+        catalog = cls(config["label_catalog"])
+        if version == cls.VERSION:
+            return catalog
+        old_defaults = [{"name": name, "aliases": [str(i), model_label]}
+                        for i, (name, _, model_label) in enumerate(_DEFAULT_LABELS)]
+        if catalog.to_list() == old_defaults:
+            return cls.defaults()
+        if version is not None:
+            return catalog
+        # Pre-versioned catalogs inherited any available built-in shortcuts.
         by_name = {record["name"]: record for record in catalog.to_list()}
         occupied = catalog._names.union(catalog._aliases)
         for name, class_id, model_label in _DEFAULT_LABELS:
@@ -71,6 +90,10 @@ class LabelCatalog:
             record["aliases"].extend(alias for alias in (class_id, model_label)
                                      if alias not in occupied)
         return cls(list(by_name.values()))
+
+    @classmethod
+    def from_legacy(cls, records):
+        return cls.from_config({"label_catalog": records}, None)
 
     def __init__(self, records=None):
         if records is None:
@@ -109,6 +132,11 @@ class LabelCatalog:
         """Return the canonical label only when the complete token matches."""
         text = _text(text, "标签")
         return self._aliases.get(text, text)
+
+    def has_longer_token(self, prefix):
+        """Can further typing reach a configured alias or canonical name?"""
+        return any(token != prefix and token.startswith(prefix)
+                   for tokens in (self._names, self._aliases) for token in tokens)
 
     def add_label(self, name):
         """Add a canonical label without aliases; existing names are a no-op."""
@@ -234,32 +262,8 @@ class AnnotationStore:
             label_catalog = label_catalog.to_list()
         document["label_catalog"] = LabelCatalog(label_catalog).to_list()
         sidecar = self.sidecar_path(image_path)
-        temporary_path = None
         try:
-            # Same-directory replacement stays on the same filesystem, including
-            # Windows and network shares that support atomic rename/replace.
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                newline="\n",
-                dir=os.path.dirname(sidecar),
-                prefix="." + os.path.basename(sidecar) + ".",
-                suffix=".tmp",
-                delete=False,
-            ) as stream:
-                temporary_path = stream.name
-                json.dump(document, stream, ensure_ascii=False, indent=2, allow_nan=False)
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_path, sidecar)
-            temporary_path = None
+            write_json_atomic(sidecar, document, indent=2)
         except OSError as error:
             raise OSError(f"无法保存标注文件：{sidecar}\n{error}") from error
-        finally:
-            if temporary_path is not None:
-                try:
-                    os.unlink(temporary_path)
-                except OSError:
-                    pass
         return sidecar

@@ -4,6 +4,8 @@ Masks are grayscale QImages. Qt supplies image decoding, painting, alpha
 composition and copy-on-write snapshots; no vision or numerical runtime is used.
 """
 
+from dataclasses import dataclass
+
 from PySide6.QtCore import QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -42,15 +44,43 @@ class ScalableImageLabel(QLabel):
         painter.drawPixmap(int(x), int(y), size.width(), size.height(), self._original_pixmap)
 
 
-class GridItem(QGraphicsItem):
-    """Paint only the visible portion of the slicing grid."""
+@dataclass(frozen=True)
+class ReviewGrid:
+    """Stride-sized review cells in row-major order, including partial edge cells."""
 
-    def __init__(self, rect, stride, patch_width, patch_height):
+    width: int
+    height: int
+    stride: int
+
+    @property
+    def columns(self):
+        return (self.width + self.stride - 1) // self.stride
+
+    @property
+    def rows(self):
+        return (self.height + self.stride - 1) // self.stride
+
+    def __len__(self):
+        return self.rows * self.columns
+
+    def cell(self, index):
+        row, column = divmod(index, self.columns)
+        x, y = column * self.stride, row * self.stride
+        return QRect(x, y, min(self.stride, self.width - x), min(self.stride, self.height - y))
+
+    def index_at(self, x, y):
+        if 0 <= x < self.width and 0 <= y < self.height:
+            return (int(y) // self.stride) * self.columns + int(x) // self.stride
+        return None
+
+
+class GridItem(QGraphicsItem):
+    """Draw grid lines clipped to the exposed region, including partial edge cells."""
+
+    def __init__(self):
         super().__init__()
-        self._rect = rect
-        self._stride = stride
-        self._patch_width = patch_width
-        self._patch_height = patch_height
+        self.grid = ReviewGrid(0, 0, 128)
+        self.setFlag(QGraphicsItem.ItemUsesExtendedStyleOption)
         self._pen = QPen(Qt.cyan, 1)
         self._highlight_rect = QRectF()
         self._highlight_pen = QPen(QColor(255, 0, 255), 5)
@@ -64,54 +94,27 @@ class GridItem(QGraphicsItem):
         self._highlight_rect = rect
         self.update()
 
-    def set_rect(self, rect):
+    def set_grid(self, grid):
         self.prepareGeometryChange()
-        self._rect = rect
-        self.update()
-
-    def set_stride(self, stride):
-        self._stride = max(1, stride)
-        self.update()
-
-    def set_patch_size(self, width, height):
-        self._patch_width = max(1, width)
-        self._patch_height = max(1, height)
+        self.grid = grid
         self.update()
 
     def boundingRect(self):
-        return self._rect
-
-    def get_patch_counts(self):
-        if self._rect.isNull() or self._stride <= 0:
-            return 0, 0
-        columns = max(0, (int(self._rect.width()) - self._patch_width) // self._stride + 1)
-        rows = max(0, (int(self._rect.height()) - self._patch_height) // self._stride + 1)
-        return rows, columns
+        return QRectF(0, 0, self.grid.width, self.grid.height)
 
     def paint(self, painter, option, widget=None):
-        if self._rect.isNull() or self._stride <= 0:
+        bounds = self.boundingRect()
+        exposed = option.exposedRect.intersected(bounds).toAlignedRect()
+        if exposed.isEmpty():
             return
-        exposed = option.exposedRect
-        left = int(max(self._rect.left(), exposed.left()))
-        right = int(min(self._rect.right(), exposed.right()))
-        top = int(max(self._rect.top(), exposed.top()))
-        bottom = int(min(self._rect.bottom(), exposed.bottom()))
-        start_x, start_y = int(self._rect.left()), int(self._rect.top())
-        column = max(0, (left - self._patch_width - start_x) // self._stride)
-        row = max(0, (top - self._patch_height - start_y) // self._stride)
-        if start_x + column * self._stride + self._patch_width < left:
-            column += 1
-        if start_y + row * self._stride + self._patch_height < top:
-            row += 1
+        step = self.grid.stride
 
         def draw_grid():
-            y = start_y + row * self._stride
-            while y + self._patch_height <= int(self._rect.bottom()) + 1 and y <= bottom:
-                x = start_x + column * self._stride
-                while x + self._patch_width <= int(self._rect.right()) + 1 and x <= right:
-                    painter.drawRect(x, y, self._patch_width, self._patch_height)
-                    x += self._stride
-                y += self._stride
+            painter.drawRect(bounds)
+            for x in range(((exposed.left() + step - 1) // step) * step, exposed.right() + 2, step):
+                painter.drawLine(x, exposed.top(), x, exposed.bottom() + 1)
+            for y in range(((exposed.top() + step - 1) // step) * step, exposed.bottom() + 2, step):
+                painter.drawLine(exposed.left(), y, exposed.right() + 1, y)
 
         if self._smart_grid:
             painter.setPen(QPen(Qt.black, 1))
@@ -143,13 +146,14 @@ class SliceCanvas(QGraphicsView):
         self.setScene(self._scene)
         self._pixmap_item = QGraphicsPixmapItem()
         self._scene.addItem(self._pixmap_item)
-        self._grid_item = GridItem(QRectF(), 128, 256, 256)
+        self._grid_item = GridItem()
         self._scene.addItem(self._grid_item)
         self._mask_item = QGraphicsPixmapItem()
         self._mask_item.setOpacity(0.5)
         self._scene.addItem(self._mask_item)
         self.setBackgroundBrush(Qt.black)
         self._mask = None
+        self._saved_mask = None
         self._undo_stack = []
         self._redo_stack = []
 
@@ -183,8 +187,9 @@ class SliceCanvas(QGraphicsView):
         self._pixmap_item.setPixmap(pixmap)
         rect = QRectF(pixmap.rect())
         self._scene.setSceneRect(rect)
-        self._grid_item.set_rect(rect)
+        self._grid_item.set_grid(ReviewGrid(pixmap.width(), pixmap.height(), self.review_grid.stride))
         self._mask = None
+        self._saved_mask = None
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._update_mask_item()
@@ -196,22 +201,21 @@ class SliceCanvas(QGraphicsView):
         if self._mask is None and not pixmap.isNull():
             self._mask = QImage(pixmap.width(), pixmap.height(), QImage.Format_Grayscale8)
             self._mask.fill(0)
+            self.mark_mask_saved()
             self._update_mask_item()
 
     def set_stride(self, stride):
-        self._grid_item.set_stride(stride)
+        self._grid_item.set_grid(ReviewGrid(self.review_grid.width, self.review_grid.height, max(1, stride)))
 
     def set_smart_grid(self, enabled):
         self._grid_item.set_smart_grid(enabled)
 
-    def set_patch_size(self, width, height):
-        self._grid_item.set_patch_size(width, height)
-
     def set_highlight_rect(self, rect):
         self._grid_item.set_highlight_rect(rect)
 
-    def get_patch_counts(self):
-        return self._grid_item.get_patch_counts()
+    @property
+    def review_grid(self):
+        return self._grid_item.grid
 
     def set_mask_opacity(self, opacity):
         self._mask_item.setOpacity(opacity)
@@ -226,10 +230,11 @@ class SliceCanvas(QGraphicsView):
     def reset_view(self):
         self._pixmap_item.setPixmap(QPixmap())
         self._mask = None
+        self._saved_mask = None
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._update_mask_item()
-        self._grid_item.set_rect(QRectF())
+        self._grid_item.set_grid(ReviewGrid(0, 0, self.review_grid.stride))
         self.scene().setSceneRect(QRectF())
 
     def push_undo(self):
@@ -283,10 +288,17 @@ class SliceCanvas(QGraphicsView):
     def get_mask(self):
         return QImage(self._mask) if self._mask is not None else None
 
+    def mark_mask_saved(self):
+        self._saved_mask = self.get_mask()
+
+    def has_mask_changes(self):
+        return self._mask != self._saved_mask
+
     def set_mask(self, mask):
         if mask is None:
             return
         self._mask = mask.convertToFormat(QImage.Format_Grayscale8)
+        self.mark_mask_saved()
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._update_mask_item()

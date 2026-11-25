@@ -1,6 +1,6 @@
 """One-to-one GT/prediction matching by intersection over the smaller box area."""
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from heapq import heappop, heappush
 from math import inf, isfinite, nextafter
@@ -16,6 +16,8 @@ def _axis_overlap(a, width, b, other_width):
 
 def _eligible_pairs(gt_boxes, prediction_boxes, min_coverage):
     """Sweep left to right, comparing only rectangles with overlapping x ranges."""
+    if not 0 <= min_coverage <= 1:
+        raise ValueError("覆盖率阈值须在 0 和 1 之间。")
     rectangles = [[], []]
     events = []
     for side, boxes in enumerate((gt_boxes, prediction_boxes)):
@@ -140,8 +142,6 @@ def _component_pairs(edges):
 
 def match_pairs(gt_boxes, prediction_boxes, min_coverage=0.0):
     """Return matched (GT index, prediction index) pairs, independent of class."""
-    if not 0 <= min_coverage <= 1:
-        raise ValueError("覆盖率阈值须在 0 和 1 之间。")
     by_gt, by_pred = defaultdict(list), defaultdict(list)
     for gt, pred, score in _eligible_pairs(gt_boxes, prediction_boxes, min_coverage):
         by_gt[gt].append((gt, pred, score))
@@ -171,8 +171,42 @@ def match_pairs(gt_boxes, prediction_boxes, min_coverage=0.0):
     return sorted(pairs)
 
 
+def _maximum_match_count(neighbors, prediction_count):
+    """Augment one GT at a time until its reachable predictions are exhausted."""
+    gt_match = [-1] * len(neighbors)
+    pred_owner = [-1] * prediction_count
+    count = 0
+    for root, candidates in enumerate(neighbors):
+        if count == prediction_count:
+            break
+        if not candidates:
+            continue
+        pending = deque([root])
+        parent = {}
+        while pending:
+            gt = pending.popleft()
+            for pred in neighbors[gt]:
+                if pred in parent:
+                    continue
+                parent[pred] = gt
+                if pred_owner[pred] != -1:
+                    pending.append(pred_owner[pred])
+                    continue
+                # Reassign along the whole alternating path back to the free GT.
+                while pred != -1:
+                    gt = parent[pred]
+                    pred_owner[pred] = gt
+                    gt_match[gt], pred = pred, gt_match[gt]
+                count += 1
+                pending.clear()
+                break
+    return count
+
+
 def match_counts(gt_boxes, prediction_boxes, min_coverage=0.0):
-    """Return (true positives, GT count, prediction count)."""
+    """Return (true positives, GT count, prediction count) without ranking ties."""
     gt_boxes, prediction_boxes = tuple(gt_boxes), tuple(prediction_boxes)
-    pairs = match_pairs(gt_boxes, prediction_boxes, min_coverage)
-    return len(pairs), len(gt_boxes), len(prediction_boxes)
+    neighbors = [[] for _ in gt_boxes]
+    for gt, pred, _ in _eligible_pairs(gt_boxes, prediction_boxes, min_coverage):
+        neighbors[gt].append(pred)
+    return _maximum_match_count(neighbors, len(prediction_boxes)), len(gt_boxes), len(prediction_boxes)

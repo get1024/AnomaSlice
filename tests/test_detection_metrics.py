@@ -2,7 +2,7 @@ import copy
 from itertools import permutations
 import unittest
 
-from detection_metrics import _component_pairs, match_counts, match_pairs
+from detection_metrics import _component_pairs, _maximum_match_count, match_counts, match_pairs
 
 
 def box(x=0, y=0, width=4, height=4, label="划痕"):
@@ -49,6 +49,8 @@ class DetectionMetricTests(unittest.TestCase):
         pred = [box(0, width=10), box(9, width=10)]
         self.assertEqual(match_pairs(gt, pred), [(0, 1), (1, 0)])
         self.assertEqual(match_pairs(gt, pred, 0.5), [(0, 0)])
+        self.assertEqual(match_counts(gt, pred), (2, 2, 2))
+        self.assertEqual(match_counts(gt, pred, 0.5), (1, 2, 2))
 
     def test_best_total_coverage_can_skip_highest_individual_score(self):
         gt = [box(0, width=5), box(1, width=3)]
@@ -83,6 +85,8 @@ class DetectionMetricTests(unittest.TestCase):
                 valid = [weights[pair] for pair in enumerate(permutation) if pair in weights]
                 scores.append((len(valid), sum(valid)))
             self.assertEqual((len(actual), sum(weights[p] for p in actual)), max(scores), mask)
+            neighbors = [[j for j in range(3) if (i, j) in weights] for i in range(3)]
+            self.assertEqual(_maximum_match_count(neighbors, 3), max(scores)[0], mask)
 
     def test_threshold_must_be_a_proportion(self):
         for threshold in [-0.1, 1.1, float("nan")]:

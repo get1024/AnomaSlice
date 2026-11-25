@@ -17,7 +17,8 @@ from label_dialog import LabelDialog
 from project_store import ProjectManager
 from slicer import SlicerThread, count_mask_pixels
 from visual_export import iter_visual_exports, save_png
-from xml_annotations import AnnotationXml, scan_folder
+from image_dataset import scan_folder
+from xml_annotations import AnnotationXml
 
 
 def _check_visual_export(image, directory):
@@ -91,8 +92,9 @@ def verify_runtime(window):
         painter = QPainter(mask)
         painter.fillRect(0, 0, 32, 32, QColor("white"))
         painter.end()
-        catalog = LabelCatalog([{"name": "划痕", "aliases": ["1"]}])
-        if catalog.resolve("1") != "划痕" or catalog.resolve("待定1") != "待定1":
+        catalog = LabelCatalog.defaults()
+        if ([catalog.resolve(str(i)) for i in range(1, 5)] != ["掉漆", "划痕", "污渍", "其他"]
+                or catalog.resolve("待定1") != "待定1"):
             raise RuntimeError("Alias resolution failed")
         boxes = [{"label": "划痕", "bbox": [4, 5, 10, 12]}]
         for suffix in ("bmp", "jpg", "tiff", "webp"):

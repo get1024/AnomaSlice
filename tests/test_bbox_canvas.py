@@ -14,13 +14,14 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
+from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import (
     QAction, QColor, QImage, QInputDevice, QNativeGestureEvent, QPointingDevice, QWheelEvent,
 )
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMainWindow
 
+from annotation_store import LabelCatalog
 from bbox_canvas import BoxCanvasMixin
 from image_canvas import SliceCanvas
 
@@ -48,7 +49,7 @@ class BoxCanvasTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(self.canvas.load_image(self.image_path))
         self.canvas.set_annotation_mode(True)
-        self.canvas.resolve_label = lambda text: {"1": "划痕"}.get(text, text)
+        self.canvas.label_catalog = LabelCatalog([{"name": "划痕", "aliases": ["1"]}])
         self.changes = []
         self.canvas.annotations_changed = self.changes.append
 
@@ -160,6 +161,37 @@ class BoxCanvasTests(unittest.TestCase):
         self.assertAlmostEqual(height, 250, delta=1)
         self.assertLessEqual(x + width, 500)
         self.assertLessEqual(y + height, 400)
+
+    def test_overlapping_aliases_allow_both_short_and_long_tokens_without_enter(self):
+        self.canvas.label_catalog = LabelCatalog([
+            {"name": "短", "aliases": ["1"]}, {"name": "长", "aliases": ["10"]},
+        ])
+        self.canvas._alias_timer.setInterval(25)
+        self.drag((100, 100), (200, 180))
+        QTest.keyClicks(self.canvas._label_editor, "1")
+        self.assertTrue(self.canvas.has_pending_annotation())
+        QTest.keyClicks(self.canvas._label_editor, "0")
+        self.assertFalse(self.canvas.has_pending_annotation())
+        self.assertEqual(self.canvas.get_annotations()[0]["label"], "长")
+        self.drag((210, 100), (310, 180))
+        QTest.keyClicks(self.canvas._label_editor, "1")
+        QTest.qWait(100)
+        self.assertFalse(self.canvas.has_pending_annotation())
+        self.assertEqual(self.canvas.get_annotations()[1]["label"], "短")
+
+    def test_typing_alias_renames_but_opening_editor_preserves_imported_alias(self):
+        self.canvas.label_catalog = LabelCatalog.defaults()
+        self.canvas.set_annotations([{"label": "2", "bbox": [100, 100, 100, 80]}])
+        point = self.canvas.mapFromScene(QPointF(130, 130))
+        QTest.mouseDClick(self.canvas.viewport(), Qt.LeftButton, Qt.NoModifier, point)
+        self.assertTrue(self.canvas.has_pending_annotation())
+        QTest.keyClicks(self.canvas._label_editor, "scrat")
+        self.assertTrue(self.canvas.has_pending_annotation())
+        QTest.keyClicks(self.canvas._label_editor, "ch")
+        self.assertFalse(self.canvas.has_pending_annotation())
+        self.assertEqual(self.canvas.get_annotations()[0]["label"], "划痕")
+        self.canvas.annotation_undo()
+        self.assertEqual(self.canvas.get_annotations()[0]["label"], "2")
 
     def test_click_does_not_create_box_and_can_select(self):
         self.canvas.set_annotations([{"label": "划痕", "bbox": [100, 100, 100, 80]}])
@@ -315,6 +347,17 @@ class BoxCanvasTests(unittest.TestCase):
         QTest.keyClick(editor, Qt.Key_Return)
         self.assertEqual(self.canvas.get_annotations()[0]["label"], "scratch")
         self.assertEqual(triggered, [])
+
+    def test_resizing_while_typing_keeps_box_and_input(self):
+        self.drag((100, 100), (200, 180))
+        editor = self.canvas._label_editor
+        QTest.keyClicks(editor, "dent")
+        self.window.resize(700, 500)
+        self.app.processEvents()
+        self.assertTrue(self.canvas.has_pending_annotation())
+        self.assertEqual(editor.text(), "dent")
+        QTest.keyClick(editor, Qt.Key_Return)
+        self.assertEqual(self.canvas.get_annotations()[0]["label"], "dent")
 
     def test_slice_mode_retains_click_signal_and_new_image_resets_box_history(self):
         self.drag((100, 100), (200, 180))

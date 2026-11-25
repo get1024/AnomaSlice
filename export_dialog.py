@@ -37,10 +37,10 @@ class ExportDialog(QDialog):
         self.form.addRow("导出内容", self.mode)
 
         self.layers = QComboBox()
-        self.layers.addItem("1 号 XML · 人工标注（GT）", ("gt",))
+        self.layers.addItem("1 号 XML · 可编辑标签", ("gt",))
         if prediction_boxes is not None:
-            self.layers.addItem("2 号 XML · 模型预测", ("prediction",))
-            self.layers.addItem("两个 XML · GT 和预测", ("gt", "prediction"))
+            self.layers.addItem("2 号 XML · 只读对照标签", ("prediction",))
+            self.layers.addItem("两个 XML", ("gt", "prediction"))
             self.layers.setCurrentIndex(2)
         self.form.addRow("绘制标注", self.layers)
 
@@ -54,7 +54,7 @@ class ExportDialog(QDialog):
         self.form.addRow(self.empty_hint)
 
         class_names = dict.fromkeys(labels)
-        for layer, title, boxes in (("gt", "GT", gt_boxes), ("prediction", "预测", prediction_boxes or [])):
+        for layer, title, boxes in (("gt", "可编辑", gt_boxes), ("prediction", "只读对照", prediction_boxes or [])):
             for index, box in enumerate(boxes):
                 name = box["label"]
                 class_names[name] = None

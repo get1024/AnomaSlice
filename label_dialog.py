@@ -19,7 +19,7 @@ class LabelDialog(QDialog):
         self.catalog = catalog
         layout = QVBoxLayout(self)
         hint = QLabel("类别表适用于所有图片。每行填写一种缺陷，多个别名用逗号分隔。\n"
-                      "标注时输入完整别名即可使用对应的类别，区分大小写。")
+                      "标注时输入完整别名会自动确认类别，区分大小写。")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         self.scroll = QScrollArea()

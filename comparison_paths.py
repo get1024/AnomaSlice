@@ -125,7 +125,7 @@ class ComparisonSources:
         self._gt = _Source.from_path(gt_source)
         self._prediction = _Source.from_path(prediction_source)
         if self._gt is None and self._prediction is None:
-            raise ValueError("请至少指定一个 XML 文件或目录，以区分 GT 和预测。")
+            raise ValueError("请至少指定一个 XML 文件或目录，以区分可编辑标签和只读对照标签。")
         self._images = {Path(image).resolve() for image in images}
         if self.selected_image not in self._images:
             raise ValueError("最初绑定 XML 的图片不在当前图片列表中。")
@@ -201,15 +201,22 @@ class ComparisonSources:
 
     def _read_explicit_layer(self, image, *, layer, source, lookup):
         image = self._checked_image(image)
-        path = _one_match(self._explicit_candidates(source, image, lookup))
-        if image == self.selected_image:
-            if layer == "gt" and source.bound_file and not path.is_file():
-                raise ValueError(f"指定的 GT 文件已移动，请重新选择：{path}")
-        else:
-            for configured in (self._gt, self._prediction):
-                if configured and configured.bound_file and same_xml_path(path, configured.bound_file):
-                    raise ValueError(f"{configured.bound_file.name} 已绑定到 {self.selected_image.name}。")
+        path = self._explicit_path(source, image, lookup)
+        self._check_file_binding(image, (path,))
         return {layer: path}
+
+    def _explicit_path(self, source, image, lookup):
+        path = _one_match(self._explicit_candidates(source, image, lookup))
+        if source is self._gt and image == self.selected_image and source.bound_file and not path.is_file():
+            raise ValueError(f"指定的可编辑标签文件已移动，请重新选择：{path}")
+        return path
+
+    def _check_file_binding(self, image, paths):
+        if image == self.selected_image:
+            return
+        for source in (self._gt, self._prediction):
+            if source and source.bound_file and any(same_xml_path(p, source.bound_file) for p in paths):
+                raise ValueError(f"{source.bound_file.name} 已绑定到 {self.selected_image.name}。")
 
     def _explicit_candidates(self, source, image, lookup, *, protect=False):
         if source.bound_file and image == self.selected_image:
@@ -327,23 +334,15 @@ class ComparisonSources:
     def _resolve(self, image, lookup):
         image = self._checked_image(image)
         name = image.with_suffix(".xml").name
-        is_selected = image == self.selected_image
-        gt = _one_match(self._explicit_candidates(self._gt, image, lookup)) if self._gt else None
-        prediction = _one_match(self._explicit_candidates(self._prediction, image, lookup)) if self._prediction else None
-        if is_selected and self._gt and self._gt.bound_file and not gt.is_file():
-            raise ValueError(f"指定的 GT 文件已移动，请重新选择：{gt}")
+        gt = self._explicit_path(self._gt, image, lookup) if self._gt else None
+        prediction = self._explicit_path(self._prediction, image, lookup) if self._prediction else None
         if gt is None:
             gt = _one_match(_nearby_candidates(image, name, prediction, lookup))
         if prediction is None:
             prediction = _one_match(_nearby_candidates(image, name, gt, lookup))
         if same_xml_path(gt, prediction):
-            raise ValueError("GT 与预测指向同一个 XML。请选择不同的文件或目录。")
-        if not is_selected:
-            for source in (self._gt, self._prediction):
-                if source and source.bound_file and any(
-                    same_xml_path(path, source.bound_file) for path in (gt, prediction)
-                ):
-                    raise ValueError(f"{source.bound_file.name} 已绑定到 {self.selected_image.name}。")
+            raise ValueError("可编辑标签与只读对照标签指向同一个 XML。请选择不同的文件或目录。")
+        self._check_file_binding(image, (gt, prediction))
         # Overlapping source trees and custom file names can make one image's
         # GT point to another image's prediction, even with identical stems.
         for other in self._possible_prediction_owners(gt) - {image}:
@@ -354,5 +353,5 @@ class ComparisonSources:
                 nearby, fallback = _nearby_matches(other.parent, adjacent.name, lookup)
                 candidates = [*nearby, adjacent, fallback]
             if any(same_xml_path(gt, p) for p in candidates):
-                raise ValueError(f"{gt.name} 与另一张图片的预测 XML 冲突。")
+                raise ValueError(f"{gt.name} 与另一张图片的只读对照标签冲突。")
         return XmlPair(gt, prediction)

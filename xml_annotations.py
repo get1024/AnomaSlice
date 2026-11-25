@@ -1,23 +1,23 @@
-"""Match images to DefectDetection XML and edit boxes without rebuilding detector metadata."""
+"""Read and edit DefectDetection XML while preserving detector metadata."""
 
 import math
-import re
-from collections import Counter, defaultdict
 from copy import deepcopy
-from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from xml.dom import Node, minidom
 from xml.parsers.expat import ExpatError
 
 from PySide6.QtCore import QIODevice, QLockFile, QSaveFile
-from PySide6.QtGui import QColor, QImageReader
+from PySide6.QtGui import QColor
 
 from annotation_store import AnnotationStore
+# Keep the original module's dataset API available to existing scripts.
+from image_dataset import (
+    EXPORT_MARKER as EXPORT_MARKER, EXPORT_PNG_KEY as EXPORT_PNG_KEY, ImageEntry as ImageEntry,
+    image_extensions as image_extensions, natural_key as natural_key, scan_folder as scan_folder,
+)
 
 
-EXPORT_MARKER = ".anomaslice-export"
-EXPORT_PNG_KEY = "AnomaSlice-Export"
 # Windows path resolution and file reads can both deny a simultaneous atomic
 # rename. Background workers release this lock before parsing or matching boxes.
 xml_io_lock = Lock()
@@ -32,115 +32,6 @@ _EMPTY = b"""<?xml version="1.0" encoding="utf-8"?>
 def label_color(label):
     palette = {"掉漆": "#FFFF00", "划痕": "#FF0000", "污渍": "#0000FF", "其他": "#00FF00"}
     return palette.get(label) or QColor.fromHsv(sum(ord(c) * 37 for c in label) % 360, 180, 255).name()
-
-
-def image_extensions():
-    return {bytes(fmt).decode("ascii") for fmt in QImageReader.supportedImageFormats()}
-
-
-def natural_key(path):
-    return [int(s) if i % 2 else s.casefold()
-            for i, s in enumerate(re.split(r"([0-9]+)", str(path)))]
-
-
-@dataclass(frozen=True)
-class ImageEntry:
-    image: Path
-    xml: Path | None = None
-    issue: str = ""
-
-    @staticmethod
-    def lookup(path, entries):
-        image = Path(path).resolve()
-        if image not in entries:
-            # Older projects store paths only. Index the directory once on demand.
-            entries.update((entry.image, entry) for entry in scan_folder(image.parent, recursive=False,
-                                                                         selected=image))
-        if image not in entries:
-            raise ValueError("图片已移动，请重新打开文件夹。")
-        return entries[image]
-
-    def target(self):
-        if self.issue:
-            raise ValueError(self.issue)
-        adjacent = self.image.with_suffix(".xml")
-        nested = self.image.parent / "xml" / adjacent.name
-        matches = {p for p in (adjacent, nested) if p.is_file()}
-        if self.xml is not None:
-            # A case-insensitive Mac volume can open XML/Foo.XML via xml/foo.xml,
-            # although those spellings are unequal to pathlib on macOS.
-            if self.xml.is_file():
-                matches = {p for p in matches if str(p).casefold() != str(self.xml).casefold()
-                           or not p.samefile(self.xml)}
-            matches.add(self.xml)
-        if len(matches) > 1:
-            raise ValueError("存在多份同名 XML，请确认对应文件后重新打开。")
-        return next(iter(matches), nested)
-
-
-def scan_folder(root, *, recursive=True, selected=None):
-    root = Path(root).resolve(strict=True)
-    formats = image_extensions()
-    images = defaultdict(list)
-    exports = defaultdict(list)
-    xmls = defaultdict(list)
-
-    def report_error(error):
-        raise error
-
-    for directory, subdirs, names in root.walk(on_error=report_error):
-        if directory != root and EXPORT_MARKER in names:
-            subdirs.clear()
-            continue
-        if not recursive:
-            subdirs[:] = [d for d in subdirs if directory == root and d.casefold() == "xml"]
-        for name in names:
-            if name.startswith(".anomaslice-write-") and name.endswith(".tmp"):
-                continue
-            path = directory / name
-            ext = path.suffix[1:].lower()
-            if ext == "xml":
-                xmls[path.stem.casefold()].append(path)
-            elif (recursive or directory == root) and (ext in formats or QImageReader.imageFormat(str(path))):
-                # Only output-shaped filenames need a PNG header check. Real
-                # dataset images may also start with a numeric camera index.
-                generated = (ext == "png" and re.match(r"\d{6,}_", name)
-                             and QImageReader(str(path)).text(EXPORT_PNG_KEY) == "1")
-                group = exports if generated else images
-                group[path.stem.casefold()].append(path)
-
-    if not images:
-        images = exports
-    elif selected is not None:
-        selected = Path(selected).resolve()
-        matching_exports = exports.get(selected.stem.casefold(), ())
-        if selected in matching_exports or (selected.suffix.casefold() == ".xml" and matching_exports
-                                            and selected.stem.casefold() not in images):
-            images = exports
-    entries = []
-    for stem, group in images.items():
-        candidates = xmls.get(stem, [])
-        nearby = {}
-        for image in group:
-            nearby[image] = [
-                xml for xml in candidates
-                if xml.parent == image.parent or (
-                    xml.parent.name.casefold() == "xml" and xml.parent.parent == image.parent
-                )
-            ]
-        owners = Counter(xml for matches in nearby.values() for xml in matches)
-        per_directory = Counter(image.parent for image in group)
-        for image, matches in nearby.items():
-            if len(matches) == 1 and owners[matches[0]] == 1:
-                entries.append(ImageEntry(image, matches[0]))
-            elif len(group) == len(candidates) == 1:
-                # A unique stem also works for separate image and annotation trees.
-                entries.append(ImageEntry(image, candidates[0]))
-            elif matches or per_directory[image.parent] > 1 or any(xml not in owners for xml in candidates):
-                entries.append(ImageEntry(image, issue="同名图片或 XML 有多份，无法确定对应关系。"))
-            else:
-                entries.append(ImageEntry(image))
-    return sorted(entries, key=lambda entry: natural_key(entry.image.relative_to(root)))
 
 
 def _children(node, name):

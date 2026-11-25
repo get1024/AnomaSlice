@@ -7,6 +7,8 @@ import os
 from PySide6.QtCore import QRect, QThread, Signal
 from PySide6.QtGui import QImage
 
+from image_dataset import EXPORT_PNG_KEY
+
 
 def _gray_mask(mask):
     if mask is None or mask.isNull():
@@ -75,6 +77,7 @@ class SlicerThread(QThread):
 
     @staticmethod
     def _save_png(image, path):
+        image.setText(EXPORT_PNG_KEY, "1")
         if not image.save(path, "PNG"):
             raise OSError(f"无法保存切图：{path}")
 
