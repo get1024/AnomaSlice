@@ -5,13 +5,15 @@
 
 ## 下载与运行
 
-[下载最新 AnomaSlice.exe](https://github.com/get1024/AnomaSlice/releases/latest/download/AnomaSlice.exe)
- · [版本说明](https://github.com/get1024/AnomaSlice/releases/latest)
+从 [GitHub Releases](https://github.com/get1024/AnomaSlice/releases/latest) 下载适合你电脑的版本，无需安装 Python 或 Conda。
 
-下载后双击运行，也可以将这个 EXE 直接拷给其他 Windows x64 电脑使用。
-无需安装 Python、Conda 或额外运行环境，不需要随附 `_internal` 文件夹。
+| 系统 | 下载最新版 | 安装方式 |
+| --- | --- | --- |
+| Windows x64 | [AnomaSlice.exe](https://github.com/get1024/AnomaSlice/releases/latest/download/AnomaSlice.exe) | 双击运行，也可将单个 EXE 复制到其他 Windows x64 电脑。 |
+| Mac · Apple 芯片 | [arm64 ZIP](https://github.com/get1024/AnomaSlice/releases/latest/download/AnomaSlice-macOS-arm64.zip) | 解压，将 `AnomaSlice.app` 拖入「应用程序」。 |
+| Mac · Intel 处理器 | [x86_64 ZIP](https://github.com/get1024/AnomaSlice/releases/latest/download/AnomaSlice-macOS-x86_64.zip) | 解压，将 `AnomaSlice.app` 拖入「应用程序」。 |
 
-**Mac（macOS 14 或更新版本）**：在[构建记录](https://github.com/get1024/AnomaSlice/actions/workflows/release.yml)中打开对应分支的成功构建，登录 GitHub 后下载 Mac 产物。苹果菜单 →“关于本机”显示 Apple 芯片时选 `arm64`，显示 Intel 处理器时选 `x86_64`。解压下载内容，直到看到 `AnomaSlice.app`，将它拖入「应用程序」后双击打开。文中 Ctrl 快捷键在 Mac 上使用 ⌘，例如 ⌘S 保存。
+Mac 版要求 macOS 14 或更新版本。在苹果菜单 →「关于本机」查看芯片或处理器。文中的 Ctrl 快捷键在 Mac 上使用 ⌘，例如 ⌘S 保存。
 
 Mac 构建尚未经 Apple 公证。首次打开时如果系统提示无法验证开发者，请先核对下载来源，再按 [Apple 的打开说明](https://support.apple.com/zh-cn/102445)操作。
 
