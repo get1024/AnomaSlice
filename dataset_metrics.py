@@ -8,7 +8,7 @@ from types import MappingProxyType
 from PySide6.QtCore import QThread, Signal
 
 from detection_metrics import match_counts
-from xml_annotations import AnnotationXml
+from xml_annotations import AnnotationXml, xml_io_lock
 
 
 @dataclass(frozen=True)
@@ -38,7 +38,8 @@ class DatasetMetricsScan(QThread):
             image = Path(path)
             try:
                 image = image.resolve()
-                pair = resolve(image)
+                with xml_io_lock:
+                    pair = resolve(image)
                 gt = AnnotationXml.open_path(pair.gt).boxes
                 predictions = AnnotationXml.open_path(pair.prediction).boxes
                 counts[image] = match_counts(gt, predictions, self._min_coverage)

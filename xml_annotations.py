@@ -18,9 +18,9 @@ from annotation_store import AnnotationStore
 
 EXPORT_MARKER = ".anomaslice-export"
 EXPORT_PNG_KEY = "AnomaSlice-Export"
-# On Windows a Python reader can deny an atomic rename while it holds the
-# source file open. Release this lock before parsing or rendering any boxes.
-_xml_io_lock = Lock()
+# Windows path resolution and file reads can both deny a simultaneous atomic
+# rename. Background workers release this lock before parsing or matching boxes.
+xml_io_lock = Lock()
 _EMPTY = b"""<?xml version="1.0" encoding="utf-8"?>
 <DefectDetection>
   <RawCount>0</RawCount>
@@ -219,7 +219,7 @@ class AnnotationXml:
     @classmethod
     def open_path(cls, path, *, must_exist=False):
         try:
-            with _xml_io_lock:
+            with xml_io_lock:
                 source = path.read_bytes()
         except FileNotFoundError:
             if must_exist:
@@ -307,7 +307,7 @@ class AnnotationXml:
             if current != self._source:
                 output.cancelWriting()
                 raise ValueError("XML 已被其他程序修改。请重新打开图片后再审核。")
-            with _xml_io_lock:
+            with xml_io_lock:
                 if not output.commit():
                     raise OSError(output.errorString())
         finally:

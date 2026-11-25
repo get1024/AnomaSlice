@@ -7,7 +7,7 @@ from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
 from visual_export import iter_visual_exports, save_png
-from xml_annotations import AnnotationXml, ImageEntry
+from xml_annotations import AnnotationXml, ImageEntry, xml_io_lock
 
 
 def _filename_part(text):
@@ -48,7 +48,9 @@ class ExportJob(QThread):
             if path == self.current_path and self.current_boxes[layer] is not None:
                 result[layer] = self.current_boxes[layer]
             elif self.resolve:
-                pair = pair or self.resolve(path)
+                if pair is None:
+                    with xml_io_lock:
+                        pair = self.resolve(path)
                 result[layer] = AnnotationXml.open_path(pair[layer]).boxes
             elif layer == "gt":
                 entry = ImageEntry.lookup(path, self.entries)
